@@ -224,6 +224,26 @@ def test_skips_stale_and_short_history():
 
 
 # ---------------------------------------------------------------------------
+# 4b. A restarted scanner must not re-announce a previous session's bars
+# ---------------------------------------------------------------------------
+def test_no_alerts_for_previous_session_bars():
+    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
+                           days=SESS_DAYS, seed=SEED)
+    k = composite_bars(df)[0]
+    cfg = mk_cfg()
+    frame = df.iloc[:k + 1]                     # frame ends 2026-08-05 09:15
+    rec = Recorder()
+    # next morning, before the first bar of the new session prints
+    now = datetime(2026, 8, 6, 9, 16)
+    sc = scanner_with(cfg, frame, now, rec)
+    assert sc.scan_symbol(SYM) == 0, rec.kinds
+    # ... and the same frame during its own session *does* alert
+    sc2 = scanner_with(mk_cfg(), frame, (df.index[k] + timedelta(minutes=5)).to_pydatetime(), Recorder())
+    assert sc2.scan_symbol(SYM) >= 1
+    print("ok test_no_alerts_for_previous_session_bars")
+
+
+# ---------------------------------------------------------------------------
 # 5. The data layer must not trim history unless asked
 # ---------------------------------------------------------------------------
 def test_history_is_not_trimmed():
@@ -329,6 +349,7 @@ ALL = [
     test_live_alert_confirmed_after_bar_close,
     test_alert_dedup_across_passes,
     test_skips_stale_and_short_history,
+    test_no_alerts_for_previous_session_bars,
     test_history_is_not_trimmed,
     test_session_clock_helpers,
     test_watch_lines_report_armed_references,

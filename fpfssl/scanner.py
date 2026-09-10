@@ -23,6 +23,8 @@ import os
 import time
 from datetime import datetime, timedelta
 
+import pandas as pd
+
 from .config import AppConfig
 from .data import DataError, load_symbol
 from .engine import Engine, detect_tick
@@ -144,8 +146,6 @@ def is_live_last_bar(cfg: AppConfig, last_bar_time, now: datetime | None = None)
     On weekends/holidays — or when the feed lags past the bar end — the last
     bar is already closed, so events on it are confirmed, not LIVE.
     """
-    import pandas as pd
-
     if cfg.data.source != "yahoo":
         return False
     now = now if now is not None else market_now(cfg)
@@ -171,8 +171,6 @@ def is_live_last_bar(cfg: AppConfig, last_bar_time, now: datetime | None = None)
 
 def trading_days_between(a, b) -> int:
     """Weekday (Mon-Fri) count in (a, b] for stale-data purposes."""
-    import pandas as pd
-
     a, b = pd.Timestamp(a).date(), pd.Timestamp(b).date()
     if b <= a:
         return 0
@@ -305,13 +303,26 @@ class LiveScanner:
                             sym, last_ts, stale_days)
                 return 0
             if cfg.data.is_intraday() and market_is_open(cfg, now_mkt):
-                import pandas as pd
-
-                lag_min = (now_mkt - pd.Timestamp(last_ts).to_pydatetime()).total_seconds() / 60.0
-                if lag_min > cfg.scanner.max_lag_minutes:
-                    log.warning("%s: feed lags %.0f min (last bar %s), skipped",
-                                sym, lag_min, last_ts)
-                    return 0
+                open_dt, _ = _session_bounds(cfg, now_mkt)
+                if pd.Timestamp(last_ts).to_pydatetime() >= open_dt:
+                    # the feed is inside today's session -> a large gap is real lag
+                    lag_min = (now_mkt - pd.Timestamp(last_ts).to_pydatetime()).total_seconds() / 60.0
+                    if lag_min > cfg.scanner.max_lag_minutes:
+                        log.warning("%s: feed lags %.0f min (last bar %s), skipped",
+                                    sym, lag_min, last_ts)
+                        return 0
+                else:
+                    log.info("%s: no bar from today's session yet (last %s) — "
+                             "holiday or feed not started", sym, last_ts)
+        # A restarted scanner (fresh Actions runner, evicted dedup cache) would
+        # otherwise re-announce the last `recent_bars` bars of a *previous*
+        # session as if they were news. Intraday alerts must belong to the
+        # current session: the last bar has to carry today's date.
+        if cfg.data.source == "yahoo" and cfg.data.is_intraday() \
+                and pd.Timestamp(last_ts).date() != now_mkt.date():
+            log.info("%s: newest bar %s is from a previous session — warm-up only, "
+                     "nothing to alert yet", sym, last_ts)
+            return 0
         # NB: never cut the frame down to history_bars here. The engine's
         # footprint/TAP state machine is path-dependent — an OB born 600 bars
         # ago can be the TAP reference that fires today — so every bar the

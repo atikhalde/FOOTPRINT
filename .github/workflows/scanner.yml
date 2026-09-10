@@ -22,6 +22,8 @@ on:
   schedule:
     # Every 10 min from 03:00 to 10:50 UTC (= 08:30-16:20 IST).
     - cron: '*/10 3-10 * * 1-5'
+  repository_dispatch:
+    types: [scan]          # external scheduler hook (cron-job.org etc.)
   workflow_dispatch:
     inputs:
       dry_run:
@@ -58,7 +60,7 @@ jobs:
     env:
       # Push runs are offline smoke tests; scheduled/dispatched runs are real.
       DRY_RUN: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-      ONCE: ${{ github.event_name == 'workflow_dispatch' && inputs.once || github.event_name == 'push' }}
+      ONCE: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.once) }}
       SYMBOLS: ${{ inputs.symbols }}
       INTERVAL: ${{ inputs.interval }}
     steps:

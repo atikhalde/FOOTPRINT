@@ -164,10 +164,16 @@ def diag_symbol(
                                f"{out.stale_trading_days} trading days old "
                                f"(max_stale_days={cfg.scanner.max_stale_days})")
         elif (cfg.data.is_intraday() and out.market_open
-              and out.feed_lag_minutes > cfg.scanner.max_lag_minutes):
+              and out.feed_lag_minutes > cfg.scanner.max_lag_minutes
+              and df.index[-1].date() == now.date()):
             out.status = "skipped"
             out.skip_reason = (f"feed lag {out.feed_lag_minutes:.0f} min "
                                f"(max_lag_minutes={cfg.scanner.max_lag_minutes})")
+    if (out.status == "ok" and cfg.data.source == "yahoo" and cfg.data.is_intraday()
+            and df.index[-1].date() != now.date()):
+        out.status = "stale-session"
+        out.skip_reason = (f"newest bar {out.last_bar} is from a previous session — "
+                           "warm-up only until today's first bar prints")
     if out.status == "ok" and len(df) < cfg.scanner.min_bars:
         out.status = "skipped"
         out.skip_reason = (f"only {len(df)} bars < min_bars={cfg.scanner.min_bars} "
@@ -245,6 +251,9 @@ def format_diag(d: SymbolDiag) -> str:
     lines.append(f"   {state} | last bar {'FORMING (LIVE)' if d.live_last_bar else 'closed'}"
                  + (f" | feed lag {d.feed_lag_minutes:.0f} min" if d.feed_lag_minutes else "")
                  + (f" | stale {d.stale_trading_days} trading days" if d.stale_trading_days else ""))
+    if d.status == "stale-session":
+        lines.append(f"   ⏳ {d.skip_reason}")
+        return "\n".join(lines)
     if d.status != "ok":
         lines.append(f"   ⛔ SKIPPED — {d.skip_reason}")
         return "\n".join(lines)

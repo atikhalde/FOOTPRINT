@@ -212,7 +212,11 @@ Behaviour details:
   a per symbol+event cooldown (default 60 min) prevents spam.
 * **Stale/lag guards** — symbols whose last bar is older than `max_stale_days`
   *trading* days are skipped (weekends don't count), as are symbols lagging more
-  than `max_lag_minutes` behind the live NSE clock.
+  than `max_lag_minutes` behind the live NSE clock. Pre-open (or on a holiday)
+  the newest bar is legitimately yesterday's, so that is treated as a warm-up
+  pass, not as lag: intraday alerts only ever announce bars from the **current
+  session**, which also stops a restarted scanner (fresh runner, evicted cache)
+  from re-announcing yesterday's signals.
 * **Session loop** — `scan` (without `--once`) waits for the 09:15 bell if it is
   started within `preopen_wait_minutes`, polls every `poll_minutes`, and keeps
   going until `stop_after_close_minutes` after 15:30 so the closing bar is
@@ -233,6 +237,7 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `⛔ SKIPPED — stale feed …` | the last bar is `max_stale_days` trading days old (wrong symbol/timezone, feed stuck) |
 | `⛔ SKIPPED — feed lag …` | the market is open but the feed is `max_lag_minutes` behind |
 | `⛔ SKIPPED — only N bars < min_bars` | not enough history to warm the engine up |
+| `⏳ newest bar … is from a previous session` | pre-open/holiday: nothing new to alert yet (warm-up pass) |
 | `armed FP-OBs: none` | no confirmed footprint OB — the composite needs a TAP, so nothing can fire |
 | `armed eSSL: none` | no active eSSL level to tap (all breached/expired) |
 | both armed, far away | the setup is live but price has not reached the references yet |
@@ -256,7 +261,12 @@ exact rate for your universe:
 |---|---|---|
 | `yahoo` | **live use (default)** | 15m/daily bars via `yfinance`; works on any machine with internet. NSE `.NS`, BSE `.BO`, US as-is. |
 | `csv` | offline / own data | `data/<SYMBOL>.csv` with header `date,open,high,low,close,volume` (intraday: `date` may include `HH:MM`). Great for data you already have. |
-| `synthetic` | demos/tests in sealed environments | deterministic regime-switching generator. **Not real data — never trade or draw conclusions from it.** |
+| `synthetic` | demos/tests in sealed environments | deterministic regime-switching generator (daily, or session-stamped 15m when the interval is intraday). **Not real data — never trade or draw conclusions from it.** |
+
+> **Feed latency**: Yahoo's NSE intraday quotes are delayed (~15 min) and bars
+> can print late, so a live alert can trail the tape by that much. Polling uses
+> `scanner.max_lag_minutes` to skip a symbol whose feed has genuinely stalled,
+> and `poll_minutes` controls how often a forming bar is re-read.
 
 ## Backtest engine
 
