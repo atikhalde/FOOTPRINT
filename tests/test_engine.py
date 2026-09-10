@@ -516,7 +516,27 @@ def test_repeated_evidence_union_and_start():
     print(f"ok test_repeated_evidence_union_and_start ({seen} repeated setups)")
 
 
+def test_backtest_default_config():
+    """Default backtests must run without a CLI-injected start attribute."""
+    from tempfile import TemporaryDirectory
+    from pathlib import Path
+    from fpfssl.backtest import run_backtest
+    from fpfssl.config import BacktestConfig, DataConfig, EngineConfig
+
+    cfg = BacktestConfig()
+    assert cfg.start is None
+    with TemporaryDirectory() as out:
+        report = run_backtest(
+            ["AAPL"], DataConfig(source="synthetic", history_bars=500),
+            EngineConfig(), cfg, out_dir=out,
+        )
+        assert report.summary["symbols"] == 1
+        assert (Path(out) / "summary.txt").is_file()
+    print("ok test_backtest_default_config")
+
+
 ALL = [
+    test_backtest_default_config,
     test_full_chain,
     test_essl_pool_touch_and_sweep,
     test_essl_break,

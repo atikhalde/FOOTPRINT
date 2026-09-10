@@ -163,6 +163,7 @@ class TelegramConfig:
 
 @dataclass
 class BacktestConfig:
+    start: str | None = None             # optional trading-window start (YYYY-MM-DD)
     strategy: str = "essl_ob_tap"        # essl_ob_tap | ob_tap | essl_sweep
     entry: str = "next_open"             # next_open | bar_close
     rr: float = 2.0                      # take-profit in R multiples (<=0 disables target)
