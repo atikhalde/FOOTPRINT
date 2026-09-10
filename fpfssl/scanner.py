@@ -23,6 +23,8 @@ import os
 import time
 from datetime import datetime, timedelta
 
+import pandas as pd
+
 from .config import AppConfig
 from .data import DataError, load_symbol
 from .engine import Engine, detect_tick
@@ -92,6 +94,50 @@ def market_is_open(cfg: AppConfig, now: datetime | None = None) -> bool:
     return (oh, om) <= t < (ch, cm)
 
 
+def _session_bounds(cfg: AppConfig, now: datetime) -> tuple[datetime, datetime]:
+    """Today's session open/close as naive datetimes in market time."""
+    oh, om = _parse_hhmm(cfg.scanner.market_open, "09:15")
+    ch, cm = _parse_hhmm(cfg.scanner.market_close, "15:30")
+    return (now.replace(hour=oh, minute=om, second=0, microsecond=0),
+            now.replace(hour=ch, minute=cm, second=0, microsecond=0))
+
+
+def minutes_until_close(cfg: AppConfig, now: datetime | None = None) -> float:
+    now = now if now is not None else market_now(cfg)
+    _, close_dt = _session_bounds(cfg, now)
+    return (close_dt - now).total_seconds() / 60.0
+
+
+def minutes_until_open(cfg: AppConfig, now: datetime | None = None) -> float | None:
+    """Minutes until the next session open (None on weekends)."""
+    now = now if now is not None else market_now(cfg)
+    open_dt, close_dt = _session_bounds(cfg, now)
+    if now < open_dt:
+        return (open_dt - now).total_seconds() / 60.0
+    # after the close (or a weekend): next weekday's open
+    days = 0
+    probe = now
+    while days < 7:
+        probe = probe + timedelta(days=1)
+        days += 1
+        if probe.weekday() < 5:
+            nxt_open, _ = _session_bounds(cfg, probe)
+            return (nxt_open - now).total_seconds() / 60.0
+    return None
+
+
+def _session_finished(cfg: AppConfig, now: datetime) -> bool:
+    """True once the close (plus a settling grace) has passed.
+
+    The grace matters: the final 15m bar closes at 15:30, and Yahoo needs a
+    few minutes before the closing bar is final — the scanner keeps polling
+    through `stop_after_close_minutes` so the last bar still gets alerted.
+    """
+    if now.weekday() >= 5:
+        return True
+    return minutes_until_close(cfg, now) < -abs(cfg.scanner.stop_after_close_minutes)
+
+
 def is_live_last_bar(cfg: AppConfig, last_bar_time, now: datetime | None = None) -> bool:
     """Is the feed's last bar still forming? (Pine barstate.isconfirmed=False).
 
@@ -100,8 +146,6 @@ def is_live_last_bar(cfg: AppConfig, last_bar_time, now: datetime | None = None)
     On weekends/holidays — or when the feed lags past the bar end — the last
     bar is already closed, so events on it are confirmed, not LIVE.
     """
-    import pandas as pd
-
     if cfg.data.source != "yahoo":
         return False
     now = now if now is not None else market_now(cfg)
@@ -127,8 +171,6 @@ def is_live_last_bar(cfg: AppConfig, last_bar_time, now: datetime | None = None)
 
 def trading_days_between(a, b) -> int:
     """Weekday (Mon-Fri) count in (a, b] for stale-data purposes."""
-    import pandas as pd
-
     a, b = pd.Timestamp(a).date(), pd.Timestamp(b).date()
     if b <= a:
         return 0
@@ -138,6 +180,48 @@ def trading_days_between(a, b) -> int:
             n += 1
         d += timedelta(days=1)
     return n
+
+
+def watch_lines(res, cfg: AppConfig, tick: float, limit: int = 3) -> list[str]:
+    """One log line describing what is armed right now.
+
+    A silent scan pass is otherwise indistinguishable from a broken one: this
+    prints the nearest live TAP reference, the nearest active eSSL level and
+    the distance price still has to travel, so `scan` output explains itself.
+    """
+    price = float(res.close[-1])
+    zones = []
+    for z in res.zones:
+        if not z.active:
+            continue
+        ref = float(z.source_reference)
+        zones.append((abs(price - ref),
+                      "FP-OB #%d ref %.2f (band %.2f-%.2f, %s, taps %d) price %+.2f%% away"
+                      % (z.id, ref, z.bottom, z.top,
+                         "departed" if z.source_departed else "awaiting departure",
+                         z.source_taps, (price - ref) / price * 100.0)))
+    pools = []
+    for p in res.pools:
+        if p.active and p.scope == 1:
+            lvl = float(p.lower)
+            pools.append((abs(price - lvl),
+                          "eSSL #%d level %.2f (%d member(s)) price %+.2f%% away"
+                          % (p.id, lvl, p.members, (price - lvl) / price * 100.0)))
+    zones.sort(key=lambda x: x[0])
+    pools.sort(key=lambda x: x[0])
+    if not zones and not pools:
+        return ["armed: nothing — no active FP-OB and no active eSSL level, "
+                "so no TAP/sweep/eSSL event can fire yet"]
+    out = []
+    if zones:
+        out.append("armed FP-OBs: " + " | ".join(t for _, t in zones[:limit]))
+    else:
+        out.append("armed FP-OBs: none (composite cannot fire without a TAP)")
+    if pools:
+        out.append("armed eSSL:   " + " | ".join(t for _, t in pools[:limit]))
+    else:
+        out.append("armed eSSL:   none")
+    return out
 
 
 class LiveScanner:
@@ -219,22 +303,42 @@ class LiveScanner:
                             sym, last_ts, stale_days)
                 return 0
             if cfg.data.is_intraday() and market_is_open(cfg, now_mkt):
-                import pandas as pd
-
-                lag_min = (now_mkt - pd.Timestamp(last_ts).to_pydatetime()).total_seconds() / 60.0
-                if lag_min > cfg.scanner.max_lag_minutes:
-                    log.warning("%s: feed lags %.0f min (last bar %s), skipped",
-                                sym, lag_min, last_ts)
-                    return 0
-        df = df.tail(cfg.data.history_bars)
+                open_dt, _ = _session_bounds(cfg, now_mkt)
+                if pd.Timestamp(last_ts).to_pydatetime() >= open_dt:
+                    # the feed is inside today's session -> a large gap is real lag
+                    lag_min = (now_mkt - pd.Timestamp(last_ts).to_pydatetime()).total_seconds() / 60.0
+                    if lag_min > cfg.scanner.max_lag_minutes:
+                        log.warning("%s: feed lags %.0f min (last bar %s), skipped",
+                                    sym, lag_min, last_ts)
+                        return 0
+                else:
+                    log.info("%s: no bar from today's session yet (last %s) — "
+                             "holiday or feed not started", sym, last_ts)
+        # A restarted scanner (fresh Actions runner, evicted dedup cache) would
+        # otherwise re-announce the last `recent_bars` bars of a *previous*
+        # session as if they were news. Intraday alerts must belong to the
+        # current session: the last bar has to carry today's date.
+        if cfg.data.source == "yahoo" and cfg.data.is_intraday() \
+                and pd.Timestamp(last_ts).date() != now_mkt.date():
+            log.info("%s: newest bar %s is from a previous session — warm-up only, "
+                     "nothing to alert yet", sym, last_ts)
+            return 0
+        # NB: never cut the frame down to history_bars here. The engine's
+        # footprint/TAP state machine is path-dependent — an OB born 600 bars
+        # ago can be the TAP reference that fires today — so every bar the
+        # feed serves is live state. `data.max_bars` is the only cap.
         tick = cfg.data.tick_overrides.get(sym, detect_tick(df, sym))
         live_last = is_live_last_bar(cfg, df.index[-1], now_mkt)
         res = Engine(sym, cfg.engine, tick, tf=cfg.data.interval).run(df, live_last_bar=live_last)
         c = res.counters
-        log.info("%s [%s]: %d bars%s | OBs %d (active %d) | taps %d | eSSL taps %d | active eSSL %d | fresh %d",
-                 sym, tf, len(df), " (LIVE last bar)" if live_last else "",
+        fmt = "%Y-%m-%d %H:%M" if cfg.data.is_intraday() else "%Y-%m-%d"
+        log.info("%s [%s]: %d bars %s → %s%s | OBs %d (active %d) | taps %d | eSSL taps %d | active eSSL %d | fresh %d",
+                 sym, tf, len(df), df.index[0].strftime(fmt), last_ts.strftime(fmt),
+                 " (LIVE last bar)" if live_last else "",
                  c.get("footprint_ob_created", 0), c.get("active_zones", 0),
                  c.get("taps", 0), c.get("essl_taps", 0), c.get("active_e_ssl", 0), c.get("fresh_active", 0))
+        for line in watch_lines(res, cfg, tick):
+            log.info("%s: %s", sym, line)
 
         sc = cfg.scanner
         want = set(sc.alert_events or [])
@@ -308,13 +412,59 @@ class LiveScanner:
         return total
 
     def run_forever(self):
+        """Poll until the session ends.
+
+        Designed for a single scheduled trigger that has to cover the whole
+        NSE session (09:15-15:30 IST): GitHub's cron is best-effort and drops
+        most ticks of a 5-minute schedule, so one long job that polls
+        internally is far more reliable than 96 one-shot jobs.
+
+        * started before the open   -> waits for the open, then polls
+        * started during the session -> polls immediately
+        * started after the close   -> one final pass, then exits
+        """
         poll = max(1.0, self.cfg.scanner.poll_minutes)
         tf = timeframe_label(self.cfg.data.interval)
-        log.info("starting live scanner: %d symbols [%s], poll every %.1f min (ctrl-c to stop)",
-                 len(self.symbols), tf, poll)
+        now = market_now(self.cfg)
+        log.info("starting live scanner: %d symbols [%s], poll every %.1f min, "
+                 "session %s-%s %s (ctrl-c to stop)",
+                 len(self.symbols), tf, poll,
+                 self.cfg.scanner.market_open, self.cfg.scanner.market_close,
+                 self.cfg.scanner.market_timezone)
+        # pre-open: wait for the bell instead of hammering the feed — but only
+        # when the open is close. A run started hours early does one pass and
+        # exits so it does not hold the runner (a later tick starts the session).
+        if not market_is_open(self.cfg, now):
+            wait_min = minutes_until_open(self.cfg, now)
+            if wait_min is None or wait_min > self.cfg.scanner.preopen_wait_minutes:
+                log.info("market closed (%s; next open in %s min) — single pass, then exit",
+                         now.strftime("%a %H:%M"),
+                         "?" if wait_min is None else f"{wait_min:.0f}")
+                self.scan_once()
+                self._save_state()
+                return
+            if wait_min > 0:
+                log.info("market closed now (%s) — waiting %.0f min for the open",
+                         now.strftime("%a %H:%M"), wait_min)
+                deadline = now + timedelta(minutes=wait_min)
+                while market_now(self.cfg) < deadline:
+                    time.sleep(min(60.0, max(1.0, wait_min * 60.0)))
         while True:
             try:
                 self.scan_once()
             except Exception as e:  # noqa: BLE001
                 log.exception("scan pass failed: %s", e)
-            time.sleep(poll * 60)
+            now = market_now(self.cfg)
+            if _session_finished(self.cfg, now):
+                log.info("session finished (%s) — scanner exiting",
+                         now.strftime("%a %H:%M"))
+                self._save_state()
+                return
+            # fixed cadence, but never oversleep the close; inside the settle
+            # window after the close keep the same cadence (no busy loop)
+            until_close = minutes_until_close(self.cfg, now)
+            if until_close <= 0:
+                nap = poll * 60.0
+            else:
+                nap = min(poll * 60.0, max(30.0, until_close * 60.0))
+            time.sleep(nap)

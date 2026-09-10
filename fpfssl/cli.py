@@ -4,6 +4,7 @@ Usage (from the repo root):
     python -m fpfssl scan [--once] [--symbols RELIANCE.NS,TCS.NS] [--interval 15m] [--dry-run]
     python -m fpfssl backtest [--strategy essl_ob_tap|ob_tap|essl_sweep] [--interval 15m]
     python -m fpfssl report [--symbol RELIANCE.NS] [--interval 15m]
+    python -m fpfssl diagnose [--symbols RELIANCE.NS] [--at "2026-09-10 12:00"]
     python -m fpfssl test-telegram
     python -m fpfssl sample-data [--bars 1500]
 """
@@ -13,6 +14,8 @@ import argparse
 import logging
 import os
 import sys
+
+from datetime import datetime
 
 from . import __version__
 from .config import load_config
@@ -38,7 +41,20 @@ def cmd_scan(args):
         cfg.data.interval = args.interval
     if args.dry_run:
         cfg.telegram.dry_run = True
+    if getattr(args, "no_dry_run", False):
+        # explicit production intent: never let a stale config value swallow alerts
+        cfg.telegram.dry_run = False
     notifier = TelegramNotifier(cfg.telegram)
+    if not notifier.cfg.dry_run and not notifier.ready:
+        # fail fast: a live scanner that cannot deliver is worse than no scanner
+        print("Telegram is NOT configured (token/chat_id missing), so a live scan "
+              "would silently drop every alert.\nSet the TELEGRAM_BOT_TOKEN and "
+              "TELEGRAM_CHAT_ID environment variables (or telegram.token/chat_id in "
+              "config.yaml), or run with --dry-run / `diagnose` to inspect the "
+              "scanner without alerts.", file=sys.stderr)
+        sys.exit(2)
+    if notifier.cfg.dry_run:
+        print("dry-run: Telegram messages will be printed, not sent.", file=sys.stderr)
     from .scanner import LiveScanner
     sc = LiveScanner(cfg, notifier)
     if args.once:
@@ -88,7 +104,7 @@ def cmd_report(args):
     tf = timeframe_label(cfg.data.interval)
     for sym in syms:
         try:
-            df = load_symbol(sym, cfg.data).tail(cfg.data.history_bars)
+            df = load_symbol(sym, cfg.data)
         except DataError as e:
             print(f"{sym}: {e}")
             continue
@@ -134,6 +150,8 @@ def cmd_test_telegram(args):
     cfg = load_config(args.config)
     if args.dry_run:
         cfg.telegram.dry_run = True
+    if getattr(args, "no_dry_run", False):
+        cfg.telegram.dry_run = False
     n = TelegramNotifier(cfg.telegram)
     if not n.ready and not cfg.telegram.dry_run:
         print("Telegram not configured. Set telegram.token/chat_id in config.yaml or env vars\n"
@@ -145,6 +163,36 @@ def cmd_test_telegram(args):
     ok = n.send("<b>FPFSSL8.2</b> test message — Telegram connection works ✅\n"
                 f"{tf}-TF eSSL tap + footprint alerts will arrive in this format.")
     print("sent" if ok else "send failed")
+
+
+def cmd_diagnose(args):
+    """Explain the live state of every watched symbol (armed references, filters)."""
+    cfg = load_config(args.config)
+    if args.symbols:
+        cfg.symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    if args.source:
+        cfg.data.source = args.source
+    if args.interval:
+        cfg.data.interval = args.interval
+    if args.bars:
+        cfg.data.max_bars = args.bars
+    from .diag import format_diag_many, run_diag
+    now = None
+    if args.at:
+        try:
+            now = datetime.strptime(args.at, "%Y-%m-%d %H:%M")
+        except ValueError:
+            try:
+                now = datetime.strptime(args.at, "%Y-%m-%d")
+            except ValueError:
+                print(f"--at must be 'YYYY-MM-DD HH:MM' or 'YYYY-MM-DD' (got {args.at!r})",
+                      file=sys.stderr)
+                sys.exit(2)
+    live = True if args.live else None
+    diags = run_diag(cfg, cfg.symbols, now=now, live=live)
+    print(format_diag_many(diags, as_json=args.json))
+    if any(d.status != "ok" for d in diags):
+        sys.exit(0)
 
 
 def cmd_sample_data(args):
@@ -178,6 +226,8 @@ def main(argv=None):
     s.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
     s.add_argument("--interval", help="yfinance TF: 1m,5m,15m,30m,1h,1d,1wk,1mo (overrides config)")
     s.add_argument("--dry-run", action="store_true", help="print Telegram messages instead of sending")
+    s.add_argument("--no-dry-run", dest="no_dry_run", action="store_true",
+                   help="force real Telegram sends even if telegram.dry_run is true in config")
     s.set_defaults(fn=cmd_scan)
 
     b = sub.add_parser("backtest", help="backtest the alert signals")
@@ -198,7 +248,20 @@ def main(argv=None):
 
     t = sub.add_parser("test-telegram", help="send a test Telegram message")
     t.add_argument("--dry-run", action="store_true")
+    t.add_argument("--no-dry-run", dest="no_dry_run", action="store_true",
+                   help="force a real send even if telegram.dry_run is true in config")
     t.set_defaults(fn=cmd_test_telegram)
+
+    g = sub.add_parser("diagnose", help="why is the scanner (not) alerting? live state per symbol")
+    g.add_argument("--symbols", help="comma-separated override (default: config.yaml)")
+    g.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
+    g.add_argument("--interval", help="yfinance TF (overrides config)")
+    g.add_argument("--at", help="pretend the market clock is this 'YYYY-MM-DD HH:MM' (IST)")
+    g.add_argument("--live", action="store_true",
+                   help="treat the last bar as a still-forming (LIVE) bar")
+    g.add_argument("--json", action="store_true", help="machine-readable output")
+    g.add_argument("--bars", type=int, help="cap bars per symbol (default: everything the feed gives)")
+    g.set_defaults(fn=cmd_diagnose)
 
     d = sub.add_parser("sample-data", help="generate offline synthetic CSVs into data/")
     d.add_argument("--bars", type=int)

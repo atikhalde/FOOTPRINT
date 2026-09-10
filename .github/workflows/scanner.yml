@@ -1,19 +1,39 @@
 name: Scanner
 
+# ---------------------------------------------------------------------------
+# Live NSE scanner (09:15-15:30 IST = 03:45-10:00 UTC, Mon-Fri).
+#
+# Reliability design: GitHub's `schedule` trigger is best-effort — ticks are
+# delayed by 5-30 min under load and high-frequency ticks are regularly
+# dropped (this repo's history: 1 scheduled tick out of ~16 expected). So the
+# workflow does NOT need a tick every 5 minutes. Each tick starts ONE job that
+# polls internally until the close (`python -m fpfssl scan`), and the
+# `concurrency` group keeps a single scanner running: a tick that arrives while
+# a session job is running simply becomes the next queued run and takes over
+# when that job ends. Any single tick that fires near/inside the session now
+# covers the whole session.
+# ---------------------------------------------------------------------------
 on:
   push:
     paths:
       - '.github/workflows/scanner.yml'
+      - 'fpfssl/**'
+      - 'config.yaml'
   schedule:
-    # Live NSE session 09:15-15:30 IST == 03:45-10:00 UTC, Mon-Fri.
-    # Every 5 minutes across that window (GitHub may delay scheduled runs).
-    - cron: '*/5 3-10 * * 1-5'
+    # Every 10 min from 03:00 to 10:50 UTC (= 08:30-16:20 IST).
+    - cron: '*/10 3-10 * * 1-5'
+  repository_dispatch:
+    types: [scan]          # external scheduler hook (cron-job.org etc.)
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Print alerts without sending Telegram messages
+        description: Print alerts instead of sending them to Telegram
         type: boolean
-        default: true
+        default: false
+      once:
+        description: Single scan pass (default = poll until the market close)
+        type: boolean
+        default: false
       symbols:
         description: Comma-separated tickers (blank uses config.yaml)
         type: string
@@ -27,16 +47,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: scanner-${{ github.ref }}
+  # one live scanner at a time; queued ticks back each other up
+  group: scanner-session
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 14
+    # hard cap below GitHub's 6h job limit: the poller exits at the close, and
+    # a queued tick takes over if this job is cut off near the end of the day
+    timeout-minutes: 350
     env:
-      # Push runs are offline smoke tests; scheduled runs send real alerts.
+      # Push runs are offline smoke tests; scheduled/dispatched runs are real.
       DRY_RUN: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+      ONCE: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.once) }}
       SYMBOLS: ${{ inputs.symbols }}
       INTERVAL: ${{ inputs.interval }}
     steps:
@@ -46,33 +70,42 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - name: Engine tests (indicator parity + live path)
+
+      - name: Engine + live-path tests
         run: |
           python tests/test_engine.py
           python tests/test_fidelity_live.py
+          python tests/test_live_scanner.py
+
       - name: Restore alert deduplication state
         if: env.DRY_RUN != 'true'
         uses: actions/cache/restore@v4
         with:
           path: state/scanner_state.json
-          key: scanner-state-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: scanner-state-main-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            scanner-state-${{ github.ref_name }}-
-      - name: Scan once
+            scanner-state-main-
+
+      - name: Scan
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         shell: bash
         run: |
-          args=(scan --once)
+          args=(scan)
+          if [[ "$ONCE" == "true" ]]; then
+            args+=(--once)
+          fi
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
           elif [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
-            echo '::error::Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID repository secrets.'
+            echo '::error::Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID repository secrets (or run with dry_run).'
             exit 1
+          else
+            args+=(--no-dry-run)   # config.yaml telegram.dry_run cannot silence CI
           fi
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            args+=(--source synthetic --symbols RELIANCE.NS)
+            args+=(--source synthetic --symbols RELIANCE.NS --interval 15m)
           else
             if [[ -n "$SYMBOLS" ]]; then
               args+=(--symbols "$SYMBOLS")
@@ -82,9 +115,23 @@ jobs:
             fi
           fi
           python -m fpfssl "${args[@]}"
+
+      - name: Why (no) alert? — live state per symbol
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Scanner diagnostics"
+            echo ''
+            echo '```text'
+            # same feed/clock the scan used; --live marks the forming bar
+            python -m fpfssl diagnose 2>&1 | tail -n +2
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY" || true
+
       - name: Save alert deduplication state
         if: always() && env.DRY_RUN != 'true'
         uses: actions/cache/save@v4
         with:
           path: state/scanner_state.json
-          key: scanner-state-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: scanner-state-main-${{ github.run_id }}-${{ github.run_attempt }}

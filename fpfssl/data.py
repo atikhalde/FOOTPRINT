@@ -74,6 +74,21 @@ def _normalize(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
     return df
 
 
+
+def _cap(df: pd.DataFrame, cfg: DataConfig) -> pd.DataFrame:
+    """Apply the optional hard bar cap (``max_bars``).
+
+    Deliberately *not* capped at ``history_bars``: the live scanner needs all
+    the history the feed can serve (a footprint OB born several hundred bars
+    ago is still a live TAP candidate today, and cutting the frame drops that
+    state). The backtest slices its own trading window.
+    """
+    cap = int(getattr(cfg, "max_bars", 0) or 0)
+    if cap > 0 and len(df) > cap:
+        df = df.tail(cap)
+    return df
+
+
 def _yahoo_kwargs(cfg: DataConfig) -> dict:
     """Build yfinance history() kwargs for the configured interval."""
     interval = (cfg.interval or "1d").lower()
@@ -148,9 +163,7 @@ def load_yahoo(symbol: str, cfg: DataConfig) -> pd.DataFrame:
             df = df[df.index <= pd.Timestamp(cfg.end) + timedelta(days=1)]
         except Exception:  # noqa: BLE001
             pass
-    if len(df) > cfg.history_bars * 2:
-        df = df.tail(cfg.history_bars * 2)
-    return df
+    return _cap(df, cfg)
 
 
 def load_csv(symbol: str, cfg: DataConfig) -> pd.DataFrame:
@@ -183,9 +196,7 @@ def load_csv(symbol: str, cfg: DataConfig) -> pd.DataFrame:
     if cfg.end:
         df = df[df.index <= pd.Timestamp(cfg.end) + timedelta(days=1)]
     df = _normalize(df, symbol)
-    if len(df) > cfg.history_bars * 2:
-        df = df.tail(cfg.history_bars * 2)
-    return df
+    return _cap(df, cfg)
 
 
 def load_symbol(symbol: str, cfg: DataConfig) -> pd.DataFrame:
@@ -194,6 +205,10 @@ def load_symbol(symbol: str, cfg: DataConfig) -> pd.DataFrame:
     if cfg.source == "csv":
         return load_csv(symbol, cfg)
     if cfg.source == "synthetic":
-        from .synthetic import generate
+        from .synthetic import generate, generate_intraday
+        if cfg.is_intraday():
+            # intraday synthetic bars (session stamps) so the LIVE path —
+            # forming last bar, HH:MM stamps, tick rounding — works offline
+            return _cap(generate_intraday(symbol, cfg), cfg)
         return generate(symbol, cfg)
     raise DataError(f"unknown data source: {cfg.source}")

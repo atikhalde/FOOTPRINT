@@ -36,7 +36,13 @@ data:
   period: null           # yahoo lookback override (null = auto: 60d for 15m, 7d for 1m, 730d for 1h)
   prepost: false         # NSE has no pre/post session in this feed — keep false
   csv_dir: data          # used when source=csv (date,open,high,low,close,volume; date may include HH:MM)
-  history_bars: 500      # bars of history the scanner keeps per symbol (≈20 sessions on 15m)
+  # The scanner runs the engine over ALL bars the feed serves (Yahoo: ~1500 on
+  # 15m / 60d, several years on daily): the footprint-OB state machine is
+  # path-dependent, and a zone born 500+ bars ago is still a live TAP
+  # reference today — trimming the frame silently deletes those alerts.
+  # history_bars is the *minimum* the scanner wants; max_bars is the only cap
+  # (0 = keep everything).
+  history_bars: 1600
   start: null            # optional backtest start, e.g. "2022-01-01" (daily) — intraday capped by Yahoo window
   end: null
   tick_overrides: {}     # NSE/BSE resolve to 0.05 automatically; override only if needed, e.g. {RELIANCE.NS: 0.05}
@@ -46,7 +52,9 @@ scanner:
   state_file: state/scanner_state.json
   provisional_alerts: true   # alert on the still-forming bar too (marked LIVE), then again when confirmed
   alert_cooldown_minutes: 60 # per symbol+event-type spam guard
-  min_bars: 300          # skip symbols with less history (engine warmup: ATR/MA/pivots/baselines)
+  min_bars: 600          # skip symbols with less history (ATR/MA/pivot/SSL/pool warmup)
+  stop_after_close_minutes: 15   # keep polling this long past 15:30 IST for the closing bar
+  preopen_wait_minutes: 60       # started earlier than this before the open -> single pass, exit
   max_stale_days: 4      # skip symbols whose last bar is older than this many TRADING days (weekends OK)
   max_lag_minutes: 90    # intraday: skip when market is open but the feed lags more than this
   market_timezone: Asia/Kolkata  # live NSE clock (IST)
@@ -69,7 +77,10 @@ scanner:
 
 telegram:
   enabled: true
-  dry_run: true         # true = print messages to console instead of sending
+  # MUST be false for the live scanner to actually send. `true` only prints
+  # the messages to the log (use `scan --dry-run` for that instead; CI passes
+  # --no-dry-run on real runs so this flag can never silently swallow alerts).
+  dry_run: false
   token: null            # or env var TELEGRAM_BOT_TOKEN (recommended)
   chat_id: null          # or env var TELEGRAM_CHAT_ID
   api_base: https://api.telegram.org
