@@ -1,9 +1,9 @@
 """Command line interface for the FPFSSL8.2 scanner / backtest.
 
 Usage (from the repo root):
-    python -m fpfssl scan [--once] [--symbols A,B] [--dry-run]
-    python -m fpfssl backtest [--strategy essl_ob_tap|ob_tap|essl_sweep] [--rr 2.0]
-    python -m fpfssl report [--symbol RELIANCE.NS]
+    python -m fpfssl scan [--once] [--symbols RELIANCE.NS,TCS.NS] [--interval 15m] [--dry-run]
+    python -m fpfssl backtest [--strategy essl_ob_tap|ob_tap|essl_sweep] [--interval 15m]
+    python -m fpfssl report [--symbol RELIANCE.NS] [--interval 15m]
     python -m fpfssl test-telegram
     python -m fpfssl sample-data [--bars 1500]
 """
@@ -34,6 +34,8 @@ def cmd_scan(args):
         cfg.symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if args.source:
         cfg.data.source = args.source
+    if args.interval:
+        cfg.data.interval = args.interval
     if args.dry_run:
         cfg.telegram.dry_run = True
     notifier = TelegramNotifier(cfg.telegram)
@@ -51,6 +53,8 @@ def cmd_backtest(args):
         cfg.symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     if args.source:
         cfg.data.source = args.source
+    if args.interval:
+        cfg.data.interval = args.interval
     if args.strategy:
         cfg.backtest.strategy = args.strategy
     if args.rr is not None:
@@ -61,7 +65,7 @@ def cmd_backtest(args):
     if args.bars:
         cfg.data.history_bars = args.bars
     from .backtest import format_summary, run_backtest
-    out = os.path.join("output", f"backtest_{cfg.backtest.strategy}_{_stamp()}")
+    out = os.path.join("output", f"backtest_{cfg.backtest.strategy}_{cfg.data.interval}_{_stamp()}")
     rep = run_backtest(cfg.symbols, cfg.data, cfg.engine, cfg.backtest, out_dir=out)
     print()
     print(format_summary(rep.summary))
@@ -75,24 +79,27 @@ def cmd_report(args):
     cfg = load_config(args.config)
     if args.source:
         cfg.data.source = args.source
+    if args.interval:
+        cfg.data.interval = args.interval
     from .data import DataError, load_symbol
     from .engine import Engine, detect_tick, summarize_state
+    from .scanner import is_live_last_bar, market_now, timeframe_label
     syms = [s.strip().upper() for s in args.symbol.split(",")] if args.symbol else cfg.symbols
+    tf = timeframe_label(cfg.data.interval)
     for sym in syms:
         try:
             df = load_symbol(sym, cfg.data).tail(cfg.data.history_bars)
         except DataError as e:
             print(f"{sym}: {e}")
             continue
-        tick = cfg.data.tick_overrides.get(sym, detect_tick(df))
-        from datetime import datetime
-        live_last = (cfg.data.source == "yahoo"
-                     and df.index[-1].date() == datetime.now().date())
-        res = Engine(sym, cfg.engine, tick).run(df, live_last_bar=live_last)
+        tick = cfg.data.tick_overrides.get(sym, detect_tick(df, sym))
+        live_last = is_live_last_bar(cfg, df.index[-1], market_now(cfg))
+        res = Engine(sym, cfg.engine, tick, tf=cfg.data.interval).run(df, live_last_bar=live_last)
         st = summarize_state(res)
-        last = df.index[-1].strftime("%Y-%m-%d")
+        last = res.dates[-1]
         px = float(df['close'].iloc[-1])
-        print(f"\n{'='*62}\n{sym} — last bar {last} close {px:.2f} (tick {tick})")
+        print(f"\n{'='*62}\n{sym} [{tf}] — last bar {last} close {px:.2f} (tick {tick})"
+              + ("  LIVE" if live_last else ""))
         print(f"counters: {res.counters}")
         print(f"pending setups: {st['pending_setups']}")
         if st['active_zones']:
@@ -115,10 +122,10 @@ def cmd_report(args):
             print("FRESH confirmed lows (unswept):")
             for r in st['fresh'][-5:]:
                 print(f"  {r['price']:.2f} origin {r['origin']} major={r['major']}")
-        recent = [e for e in res.events if e.date >= df.index[-30].strftime("%Y-%m-%d")]
+        recent = res.events[-15:]
         if recent:
-            print("recent events (30 bars):")
-            for e in recent[-15:]:
+            print("recent events:")
+            for e in recent:
                 print(f"  {e.date} {e.kind:14s} z{e.zone_id or '-':>3} p{e.pool_id or '-':>3} "
                       f"px={e.price if e.price is None else round(e.price,2)} conf={e.confirmed}")
 
@@ -133,8 +140,10 @@ def cmd_test_telegram(args):
               "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID. (Create a bot with @BotFather, get your\n"
               "chat id from @userinfobot.)")
         sys.exit(1)
+    from .scanner import timeframe_label
+    tf = timeframe_label(cfg.data.interval)
     ok = n.send("<b>FPFSSL8.2</b> test message — Telegram connection works ✅\n"
-                "Daily-TF eSSL tap + footprint alerts will arrive in this format.")
+                f"{tf}-TF eSSL tap + footprint alerts will arrive in this format.")
     print("sent" if ok else "send failed")
 
 
@@ -167,14 +176,16 @@ def main(argv=None):
     s.add_argument("--once", action="store_true", help="single pass, then exit")
     s.add_argument("--symbols", help="comma-separated override")
     s.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
+    s.add_argument("--interval", help="yfinance TF: 1m,5m,15m,30m,1h,1d,1wk,1mo (overrides config)")
     s.add_argument("--dry-run", action="store_true", help="print Telegram messages instead of sending")
     s.set_defaults(fn=cmd_scan)
 
-    b = sub.add_parser("backtest", help="backtest the alert signals on daily bars")
+    b = sub.add_parser("backtest", help="backtest the alert signals")
     b.add_argument("--strategy", choices=["essl_ob_tap", "ob_tap", "essl_sweep"])
     b.add_argument("--rr", type=float, help="take-profit in R multiples (0 disables)")
     b.add_argument("--symbols", help="comma-separated override")
     b.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
+    b.add_argument("--interval", help="yfinance TF (overrides config)")
     b.add_argument("--start", help="YYYY-MM-DD")
     b.add_argument("--bars", type=int, help="max bars per symbol")
     b.set_defaults(fn=cmd_backtest)
@@ -182,6 +193,7 @@ def main(argv=None):
     r = sub.add_parser("report", help="current zones / eSSL levels / recent events")
     r.add_argument("--symbol", help="one symbol or comma list (default: all)")
     r.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
+    r.add_argument("--interval", help="yfinance TF (overrides config)")
     r.set_defaults(fn=cmd_report)
 
     t = sub.add_parser("test-telegram", help="send a test Telegram message")

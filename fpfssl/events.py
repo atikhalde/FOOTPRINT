@@ -34,7 +34,12 @@ class Event:
 
     @property
     def date_dt(self) -> datetime:
-        return datetime.strptime(self.date, "%Y-%m-%d")
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(self.date, fmt)
+            except ValueError:
+                continue
+        return datetime.min
 
 
 # ---------------------------------------------------------------------------

@@ -30,6 +30,10 @@ on:
         description: Comma-separated tickers (blank uses config.yaml)
         type: string
         default: ''
+      interval:
+        description: Timeframe — 1m,5m,15m,30m,1h,1d (blank uses config.yaml)
+        type: string
+        default: ''
       bars:
         description: History bars per symbol
         type: string
@@ -46,6 +50,7 @@ jobs:
       SOURCE: ${{ inputs.source || 'synthetic' }}
       STRATEGY: ${{ inputs.strategy || 'essl_ob_tap' }}
       SYMBOLS: ${{ inputs.symbols }}
+      INTERVAL: ${{ inputs.interval }}
       BARS: ${{ inputs.bars || '1500' }}
     steps:
       - uses: actions/checkout@v4
@@ -54,8 +59,10 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - name: Engine scenario tests
-        run: python tests/test_engine.py
+      - name: Engine tests (indicator parity + live path)
+        run: |
+          python tests/test_engine.py
+          python tests/test_fidelity_live.py
       - name: Run backtest
         shell: bash
         run: |
@@ -66,6 +73,9 @@ jobs:
           args=(backtest --source "$SOURCE" --strategy "$STRATEGY" --bars "$BARS")
           if [[ -n "$SYMBOLS" ]]; then
             args+=(--symbols "$SYMBOLS")
+          fi
+          if [[ -n "$INTERVAL" ]]; then
+            args+=(--interval "$INTERVAL")
           fi
           python -m fpfssl "${args[@]}"
           echo "## Backtest — $SOURCE / $STRATEGY" >> "$GITHUB_STEP_SUMMARY"

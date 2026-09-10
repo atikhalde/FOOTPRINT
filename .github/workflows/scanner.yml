@@ -5,8 +5,9 @@ on:
     paths:
       - '.github/workflows/scanner.yml'
   schedule:
-    # Every 15 minutes on weekdays (UTC); GitHub may delay scheduled runs.
-    - cron: '7,22,37,52 * * * 1-5'
+    # Live NSE session 09:15-15:30 IST == 03:45-10:00 UTC, Mon-Fri.
+    # Every 5 minutes across that window (GitHub may delay scheduled runs).
+    - cron: '*/5 3-10 * * 1-5'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -15,6 +16,10 @@ on:
         default: true
       symbols:
         description: Comma-separated tickers (blank uses config.yaml)
+        type: string
+        default: ''
+      interval:
+        description: Timeframe — 1m,5m,15m,30m,1h,1d (blank uses config.yaml)
         type: string
         default: ''
 
@@ -33,6 +38,7 @@ jobs:
       # Push runs are offline smoke tests; scheduled runs send real alerts.
       DRY_RUN: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
       SYMBOLS: ${{ inputs.symbols }}
+      INTERVAL: ${{ inputs.interval }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -40,6 +46,10 @@ jobs:
           python-version: '3.11'
           cache: pip
       - run: python -m pip install -r requirements.txt
+      - name: Engine tests (indicator parity + live path)
+        run: |
+          python tests/test_engine.py
+          python tests/test_fidelity_live.py
       - name: Restore alert deduplication state
         if: env.DRY_RUN != 'true'
         uses: actions/cache/restore@v4
@@ -62,9 +72,14 @@ jobs:
             exit 1
           fi
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            args+=(--source synthetic --symbols AAPL)
-          elif [[ -n "$SYMBOLS" ]]; then
-            args+=(--symbols "$SYMBOLS")
+            args+=(--source synthetic --symbols RELIANCE.NS)
+          else
+            if [[ -n "$SYMBOLS" ]]; then
+              args+=(--symbols "$SYMBOLS")
+            fi
+            if [[ -n "$INTERVAL" ]]; then
+              args+=(--interval "$INTERVAL")
+            fi
           fi
           python -m fpfssl "${args[@]}"
       - name: Save alert deduplication state

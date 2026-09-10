@@ -1,11 +1,13 @@
 # ============================================================
 # FPFSSL8.2 scanner / backtest configuration
+# Live Indian market (NSE) via yfinance — 1:1 with the Pine indicator.
 # ============================================================
 
-# Daily-timeframe symbol universe (Yahoo Finance tickers; .NS = NSE, .BO = BSE,
-# .TO = Toronto, .L = London, ...). Edit freely.
+# NSE symbol universe (Yahoo Finance tickers; .NS = NSE, .BO = BSE).
+# The engine is timeframe-agnostic, exactly like the Pine script: it runs the
+# same bar-by-bar state machines on 15m bars as on daily bars.
 symbols:
-  # --- NSE large caps ---
+  # --- NIFTY large caps (NSE) ---
   - RELIANCE.NS
   - TCS.NS
   - INFY.NS
@@ -16,37 +18,46 @@ symbols:
   - BHARTIARTL.NS
   - LT.NS
   - ASIANPAINT.NS
-  # --- US large caps ---
-  - AAPL
-  - MSFT
-  - NVDA
-  - GOOGL
-  - AMZN
-  - META
-  - TSLA
-  - JPM
-  - WMT
+  - TITAN.NS
+  - SUNPHARMA.NS
+  - ULTRACEMCO.NS
+  - MARUTI.NS
+  - KOTAKBANK.NS
+  # --- add more NSE names as needed ---
+  # - TATAMOTORS.NS
+  # - AXISBANK.NS
+  # - NTPC.NS
+  # - POWERGRID.NS
+  # - HCLTECH.NS
 
 data:
   source: yahoo          # yahoo | csv | synthetic
-  csv_dir: data          # used when source=csv (date,open,high,low,close,volume)
-  history_bars: 500      # bars of history the scanner keeps per symbol
-  start: null            # optional backtest start, e.g. "2022-01-01"
+  interval: 15m          # LIVE TF: 1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo (use 1d for daily)
+  period: null           # yahoo lookback override (null = auto: 60d for 15m, 7d for 1m, 730d for 1h)
+  prepost: false         # NSE has no pre/post session in this feed — keep false
+  csv_dir: data          # used when source=csv (date,open,high,low,close,volume; date may include HH:MM)
+  history_bars: 500      # bars of history the scanner keeps per symbol (≈20 sessions on 15m)
+  start: null            # optional backtest start, e.g. "2022-01-01" (daily) — intraday capped by Yahoo window
   end: null
-  tick_overrides: {}     # e.g. {RELIANCE.NS: 0.05} if auto-detection is off
+  tick_overrides: {}     # NSE/BSE resolve to 0.05 automatically; override only if needed, e.g. {RELIANCE.NS: 0.05}
 
 scanner:
-  poll_minutes: 15       # how often to poll for new daily-bar events
+  poll_minutes: 5        # live 15m polling cadence (use 15 for daily)
   state_file: state/scanner_state.json
-  provisional_alerts: true   # alert on the still-forming intraday bar too (marked LIVE)
+  provisional_alerts: true   # alert on the still-forming bar too (marked LIVE), then again when confirmed
   alert_cooldown_minutes: 60 # per symbol+event-type spam guard
-  min_bars: 200          # skip symbols with less history
-  max_stale_days: 4      # skip yahoo symbols whose last bar is older than this
+  min_bars: 300          # skip symbols with less history (engine warmup: ATR/MA/pivots/baselines)
+  max_stale_days: 4      # skip symbols whose last bar is older than this many TRADING days (weekends OK)
+  max_lag_minutes: 90    # intraday: skip when market is open but the feed lags more than this
+  market_timezone: Asia/Kolkata  # live NSE clock (IST)
+  market_open: "09:15"   # NSE equity open (IST)
+  market_close: "15:30"  # NSE equity close (IST)
+  recent_bars: 3         # only the last N bars can raise new alerts (daily + intraday)
   # Which events produce Telegram messages. essl_ob_tap is the composite:
   #   price TAPPED an eSSL level on a bar where a footprint-source TAP also
   #   fired = "price at eSSL level with ALL the remaining rules matched".
   alert_events:
-    - essl_ob_tap        # 🚨 composite — primary signal (the one you asked for)
+    - essl_ob_tap        # 🚨 composite — primary signal
     - essl_sweep         # eSSL penetration + close reclaim (liquidity grab)
     - footprint_tap      # source-compatible TAP on any confirmed FP-OB
     - defence            # source defence confirmed after a TAP
@@ -96,6 +107,8 @@ backtest:
 #   source_confirm_clv, source_confirm_bos_length, source_require_sweep,
 #   source_sweep_length, ssl_enabled, ssl_internal_depth, ssl_external_depth,
 #   ssl_show_equal, ssl_equal_atr, ssl_penetration_ticks, ssl_reclaim_ticks,
-#   ssl_max_age, ssl_record_cap, fresh_show_confirmed, fresh_show_developing,
-#   fresh_low_source, fresh_record_cap
+#   ssl_max_age, ssl_record_cap, ssl_context_bars, ssl_context_distance,
+#   fresh_show_confirmed, fresh_show_developing,
+#   fresh_low_source, fresh_record_cap,
+#   essl_tap_buffer_ticks, essl_tap_max_age  (group-8 alert extension only)
 engine: {}
