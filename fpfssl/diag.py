@@ -74,6 +74,9 @@ class SymbolDiag:
     counters: dict = field(default_factory=dict)
     zones_active: int = 0
     essl_active: int = 0
+    composites: int = 0          # composite bars found in the fetched window
+    last_composite: str = ""
+    bars_since_composite: int = -1
     watches: list[Watch] = field(default_factory=list)
     recent_events: list[dict] = field(default_factory=list)
     would_alert: list[str] = field(default_factory=list)
@@ -187,6 +190,18 @@ def diag_symbol(
             out.watches.append(_watch_from_pool(p, price, tick, cfg))
     out.watches.sort(key=lambda w: abs(w.distance))
 
+    # how often does the composite actually fire on this symbol/timeframe?
+    per_bar: dict[str, set] = {}
+    for e in res.events:
+        if e.kind in (K_TAP, K_ESSL_TAP):
+            per_bar.setdefault(e.date, set()).add(e.kind)
+    comp_bars = [i for i, d in enumerate(res.dates)
+                 if K_TAP in per_bar.get(d, ()) and K_ESSL_TAP in per_bar.get(d, ())]
+    out.composites = len(comp_bars)
+    if comp_bars:
+        out.last_composite = res.dates[comp_bars[-1]]
+        out.bars_since_composite = len(df) - 1 - comp_bars[-1]
+
     cutoff = max(0, len(df) - max(1, int(cfg.scanner.recent_bars or 3)))
     for e in res.events:
         if e.bar < cutoff:
@@ -236,8 +251,14 @@ def format_diag(d: SymbolDiag) -> str:
     c = d.counters
     lines.append(f"   counters: OBs {c.get('footprint_ob_created', 0)} created / "
                  f"{d.zones_active} active | TAPs {c.get('taps', 0)} | "
+                 f"eSSL taps {c.get('essl_taps', 0)} | "
                  f"eSSL {c.get('pools_created', 0)} pools / {d.essl_active} active | "
                  f"sweeps {c.get('essl_sweeps', 0)}")
+    rate = (f"{d.composites} composite bar(s) in {d.bars} bars "
+            f"({d.composites / d.bars * 100:.2f}%)")
+    if d.last_composite:
+        rate += f"; last {d.last_composite} ({d.bars_since_composite} bars ago)"
+    lines.append(f"   alert rate: {rate}")
     if d.watches:
         lines.append("   live references (closest first):")
         for w in d.watches[:8]:
