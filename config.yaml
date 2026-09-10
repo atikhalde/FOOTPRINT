@@ -1,0 +1,98 @@
+# ============================================================
+# FPFSSL8.2 scanner / backtest configuration
+# ============================================================
+
+# Daily-timeframe symbol universe (Yahoo Finance tickers; .NS = NSE, .BO = BSE,
+# .TO = Toronto, .L = London, ...). Edit freely.
+symbols:
+  # --- NSE large caps ---
+  - RELIANCE.NS
+  - TCS.NS
+  - INFY.NS
+  - HDFCBANK.NS
+  - ICICIBANK.NS
+  - SBIN.NS
+  - ITC.NS
+  - BHARTIARTL.NS
+  - LT.NS
+  - ASIANPAINT.NS
+  # --- US large caps ---
+  - AAPL
+  - MSFT
+  - NVDA
+  - GOOGL
+  - AMZN
+  - META
+  - TSLA
+  - JPM
+  - WMT
+
+data:
+  source: yahoo          # yahoo | csv | synthetic
+  csv_dir: data          # used when source=csv (date,open,high,low,close,volume)
+  history_bars: 500      # bars of history the scanner keeps per symbol
+  start: null            # optional backtest start, e.g. "2022-01-01"
+  end: null
+  tick_overrides: {}     # e.g. {RELIANCE.NS: 0.05} if auto-detection is off
+
+scanner:
+  poll_minutes: 15       # how often to poll for new daily-bar events
+  state_file: state/scanner_state.json
+  provisional_alerts: true   # alert on the still-forming intraday bar too (marked LIVE)
+  alert_cooldown_minutes: 60 # per symbol+event-type spam guard
+  min_bars: 200          # skip symbols with less history
+  max_stale_days: 4      # skip yahoo symbols whose last bar is older than this
+  # Which events produce Telegram messages. essl_ob_tap is the composite:
+  #   price TAPPED an eSSL level on a bar where a footprint-source TAP also
+  #   fired = "price at eSSL level with ALL the remaining rules matched".
+  alert_events:
+    - essl_ob_tap        # 🚨 composite — primary signal (the one you asked for)
+    - essl_sweep         # eSSL penetration + close reclaim (liquidity grab)
+    - footprint_tap      # source-compatible TAP on any confirmed FP-OB
+    - defence            # source defence confirmed after a TAP
+    - zone_invalid       # OB invalidated (stop) or touch limit exceeded
+    - essl_created       # new eSSL reference published (fresh major low)
+
+telegram:
+  enabled: true
+  dry_run: false         # true = print messages to console instead of sending
+  token: null            # or env var TELEGRAM_BOT_TOKEN (recommended)
+  chat_id: null          # or env var TELEGRAM_CHAT_ID
+  api_base: https://api.telegram.org
+
+backtest:
+  strategy: essl_ob_tap  # essl_ob_tap (default) | ob_tap | essl_sweep
+  entry: next_open       # next_open (signal at bar close -> enter next open) | bar_close
+  rr: 2.0                # take-profit in R multiples (0 disables target)
+  max_bars: 30           # time exit
+  risk_per_trade: 0.01   # for the compounded equity curve
+  initial_capital: 100000
+  sweep_stop_atr: 0.5    # essl_sweep strategy: stop = level - 0.5*ATR
+  entry_tap: 1           # ob_tap strategy: enter on TAP n (0 = any tap)
+  one_position_per_symbol: true
+
+# Engine parameters: defaults are the Pine script's own defaults.
+# Override only what you have tested; every key mirrors a Pine input:
+#   atr_length, volume_length, support_length, strong_rvol, evidence_window,
+#   minimum_evidence_bars, repeated_bar_rvol, repeated_mean_rvol,
+#   max_evidence_body, max_evidence_range, max_downside_progress,
+#   evidence_close_location, minimum_lower_wick, support_distance_atr,
+#   max_base_width_atr, confirmation_structure, confirmation_deadline,
+#   departure_clearance, displacement_grace, minimum_displacement_range,
+#   minimum_displacement_body, displacement_close_location, break_clearance,
+#   break_grace, max_pending_setups, origin_search, origin_padding,
+#   minimum_link_ticks, minimum_width_ticks, max_ob_width_atr,
+#   invalidation_mode, invalidation_atr, invalidation_ticks,
+#   contact_departure_atr, max_contacts, max_zones, duplicate_overlap,
+#   precision_zone_method, source_atr_length, source_volume_length,
+#   source_entry_mode, source_front_run_mode, source_front_run_atr,
+#   source_front_run_ticks, source_max_zone_buffer, source_entry_offset_ticks,
+#   source_stop_atr, source_approach_atr, source_min_age, source_max_touches,
+#   source_raise_after_first_tap, source_repeat_tap_atr,
+#   source_require_departure, source_confirm_bars, source_confirm_rvol,
+#   source_confirm_clv, source_confirm_bos_length, source_require_sweep,
+#   source_sweep_length, ssl_enabled, ssl_internal_depth, ssl_external_depth,
+#   ssl_show_equal, ssl_equal_atr, ssl_penetration_ticks, ssl_reclaim_ticks,
+#   ssl_max_age, ssl_record_cap, fresh_show_confirmed, fresh_show_developing,
+#   fresh_low_source, fresh_record_cap
+engine: {}
