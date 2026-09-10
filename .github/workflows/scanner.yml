@@ -114,6 +114,16 @@ jobs:
           fi
           python -m fpfssl "${args[@]}"
 
+      - name: Publish diagnostics as annotations (debug channel)
+        if: always()
+        shell: bash
+        run: |
+          python -m fpfssl diagnose 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            esc="${line//%/%25}"; esc="${esc//$'\r'/%0D}"; esc="${esc//$'\n'/%0A}"
+            echo "::warning title=diag::${esc}"
+          done || true
+
       - name: Why (no) alert? — live state per symbol
         if: always()
         shell: bash
