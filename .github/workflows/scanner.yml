@@ -114,24 +114,6 @@ jobs:
           fi
           python -m fpfssl "${args[@]}"
 
-      - name: Publish diagnostics as annotations (debug channel)
-        if: always()
-        shell: bash
-        run: |
-          python - <<'PY' || true
-          from fpfssl.config import load_config
-          from fpfssl.diag import run_diag
-          cfg = load_config()
-          only = "RELIANCE.NS,TCS.NS,INFY.NS,HDFCBANK.NS,ICICIBANK.NS,SBIN.NS,ITC.NS,BHARTIARTL.NS".split(",")
-          for d in run_diag(cfg, only):
-              c = d.counters
-              print("::warning title=%s::bars=%d comp=%d last=%s ob=%d act=%d tap=%d esslTaps=%d act=%d sweeps=%d live=%s lag=%.0f skipped=%s"
-                    % (d.symbol, d.bars, d.composites, d.last_composite or "-",
-                       c.get("footprint_ob_created", 0), d.zones_active, c.get("taps", 0),
-                       c.get("essl_taps", 0), d.essl_active, c.get("essl_sweeps", 0),
-                       d.live_last_bar, d.feed_lag_minutes, d.skip_reason or "-"))
-          PY
-
       - name: Why (no) alert? — live state per symbol
         if: always()
         shell: bash

@@ -239,11 +239,14 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `→ essl_ob_tap @ …` | the composite **is** firing on a recent bar — check the Telegram credentials |
 
 The composite alert is deliberately strict (footprint TAP **and** eSSL tap on the
-*same* bar — the "ALL RULES" condition), so it is rare on 15m NSE data: expect
-single-digit alerts per symbol per year, clustered when price sweeps an external
-low into an armed OB. The per-event alerts in `scanner.alert_events`
-(`footprint_tap`, `essl_sweep`, `defence`, …) fire much more often if you want a
-busier feed.
+*same* bar — the "ALL RULES" condition), so expect a *low* rate rather than a
+daily stream. Measured on the configured NSE universe (15m, 60 days of Yahoo
+bars, ~1470 bars per symbol): 0–5 composite bars per symbol, i.e. roughly **one
+alert per symbol per month**, clustered when price sweeps an external low into
+an armed OB — plus `footprint_tap`/`essl_sweep`/`defence` events if you enable
+them (5–22 TAPs and 10–15 sweeps per symbol per 60 days). `diagnose` prints the
+exact rate for your universe:
+`alert rate: 2 composite bar(s) in 1471 bars (0.14%); last 2026-08-26 15:00`.
 
 ---
 

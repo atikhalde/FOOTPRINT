@@ -392,9 +392,12 @@ zone is 685 bars old — it fails against the trimmed implementation.
 
 * The composite (`essl_ob_tap`) is the source requirement verbatim: on one bar,
   an active eSSL level is tapped **and** a confirmed FP-OB's source-TAP
-  condition fires. On 15m data that is genuinely rare — measure it on your own
-  universe with `backtest --strategy essl_ob_tap` rather than expecting a
-  daily stream.
+  condition fires. On 15m data that is genuinely rare: over 60 days of Yahoo
+  bars (~1470/symbol) the configured NSE large-cap universe produced 0–5
+  composite bars per symbol (≈1/month/symbol), 1–7 confirmed FP-OBs, 5–22 TAPs
+  and 10–15 sweeps. `diagnose` prints this rate per symbol; measure your own
+  universe with `backtest --strategy essl_ob_tap` instead of expecting a daily
+  stream.
 * The forming last bar goes through section (G) (TAP) and the group-8
   forming-bar eSSL pass, so a LIVE alert can be sent mid-bar; the closed bar
   has a distinct dedupe key (and is normally suppressed by the cooldown).
