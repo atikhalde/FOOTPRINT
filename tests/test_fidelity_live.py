@@ -205,11 +205,20 @@ def test_yahoo_kwargs_intraday():
     cfg = DataConfig(source="yahoo", interval="15m")
     kw = _yahoo_kwargs(cfg)
     assert kw["interval"] == "15m" and kw["period"] == "60d", kw
+    assert kw["auto_adjust"] is False  # raw exchange prices -> indicator parity
     cfg1 = DataConfig(source="yahoo", interval="1m")
     assert _yahoo_kwargs(cfg1)["period"] == "7d"
+    # daily default = FULL history (parity with the indicator's state machines,
+    # which run from the first bar of the chart) and RAW (unadjusted) OHLC
     cfgd = DataConfig(source="yahoo", interval="1d")
     kwd = _yahoo_kwargs(cfgd)
-    assert kwd["interval"] == "1d" and kwd["start"] == "2020-01-01", kwd
+    assert kwd["interval"] == "1d" and kwd["period"] == "max", kwd
+    assert "start" not in kwd
+    assert kwd["auto_adjust"] is False
+    # explicit window still wins
+    cfgw = DataConfig(source="yahoo", interval="1d", start="2022-01-01")
+    kww = _yahoo_kwargs(cfgw)
+    assert kww["start"] == "2022-01-01" and "period" not in kww, kww
     print("ok test_yahoo_kwargs_intraday")
 
 

@@ -1,12 +1,17 @@
 """Command line interface for the FPFSSL8.2 scanner / backtest.
 
 Usage (from the repo root):
-    python -m fpfssl scan [--once] [--symbols RELIANCE.NS,TCS.NS] [--interval 15m] [--dry-run]
-    python -m fpfssl backtest [--strategy essl_ob_tap|ob_tap|essl_sweep] [--interval 15m]
-    python -m fpfssl report [--symbol RELIANCE.NS] [--interval 15m]
+    python -m fpfssl scan [--once] [--symbols full_nse|RELIANCE.NS,TCS.NS] [--interval 1d] [--dry-run]
+    python -m fpfssl backtest [--strategy essl_ob_tap|ob_tap|essl_sweep] [--interval 1d]
+    python -m fpfssl report [--symbol RELIANCE.NS] [--interval 1d]
     python -m fpfssl diagnose [--symbols RELIANCE.NS] [--at "2026-09-10 12:00"]
     python -m fpfssl test-telegram
     python -m fpfssl sample-data [--bars 1500]
+
+`full_nse` (also `all_nse` / `nse` / `*`) in the symbol list expands to the
+complete NSE equity universe fetched via yfinance-compatible tickers (.NS);
+see fpfssl/universe.py. The daily timeframe (1d) with raw exchange prices is
+the default so scanner signals 1:1 match the TradingView indicator.
 """
 from __future__ import annotations
 
@@ -19,7 +24,9 @@ from datetime import datetime
 
 from . import __version__
 from .config import load_config
+from .data import DataError
 from .telegram import TelegramNotifier
+from .universe import expand_universe
 
 
 def _set_logging(verbose: bool):
@@ -31,6 +38,15 @@ def _set_logging(verbose: bool):
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
+def _expand(cfg, refresh: bool) -> None:
+    """full_nse marker -> the complete NSE equity list (see fpfssl.universe)."""
+    try:
+        cfg.symbols = expand_universe(cfg.symbols, cfg.data, refresh=refresh)
+    except DataError as e:
+        print(f"Universe error: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
 def cmd_scan(args):
     cfg = load_config(args.config)
     if args.symbols:
@@ -39,6 +55,7 @@ def cmd_scan(args):
         cfg.data.source = args.source
     if args.interval:
         cfg.data.interval = args.interval
+    _expand(cfg, args.refresh_universe)
     if args.dry_run:
         cfg.telegram.dry_run = True
     if getattr(args, "no_dry_run", False):
@@ -71,6 +88,7 @@ def cmd_backtest(args):
         cfg.data.source = args.source
     if args.interval:
         cfg.data.interval = args.interval
+    _expand(cfg, args.refresh_universe)
     if args.strategy:
         cfg.backtest.strategy = args.strategy
     if args.rr is not None:
@@ -100,7 +118,10 @@ def cmd_report(args):
     from .data import DataError, load_symbol
     from .engine import Engine, detect_tick, summarize_state
     from .scanner import is_live_last_bar, market_now, timeframe_label
-    syms = [s.strip().upper() for s in args.symbol.split(",")] if args.symbol else cfg.symbols
+    if args.symbol:
+        cfg.symbols = [s.strip().upper() for s in args.symbol.split(",") if s.strip()]
+    _expand(cfg, args.refresh_universe)
+    syms = cfg.symbols
     tf = timeframe_label(cfg.data.interval)
     for sym in syms:
         try:
@@ -176,6 +197,7 @@ def cmd_diagnose(args):
         cfg.data.interval = args.interval
     if args.bars:
         cfg.data.max_bars = args.bars
+    _expand(cfg, args.refresh_universe)
     from .diag import format_diag_many, run_diag
     now = None
     if args.at:
@@ -200,6 +222,13 @@ def cmd_sample_data(args):
     if args.bars:
         cfg.data.history_bars = args.bars
     os.makedirs(cfg.data.csv_dir, exist_ok=True)
+    # full_nse for the offline generator means the built-in demo list
+    from .config import AppConfig as _AC
+    from .universe import UNIVERSE_MARKERS
+    if any(str(s).strip().lower() in UNIVERSE_MARKERS for s in cfg.symbols):
+        cfg.symbols = ([s for s in cfg.symbols
+                        if str(s).strip().lower() not in UNIVERSE_MARKERS]
+                       + list(_AC().symbols))
     from .synthetic import generate
     for sym in cfg.symbols:
         df = generate(sym, cfg.data)
@@ -222,9 +251,11 @@ def main(argv=None):
 
     s = sub.add_parser("scan", help="live scanner with Telegram alerts")
     s.add_argument("--once", action="store_true", help="single pass, then exit")
-    s.add_argument("--symbols", help="comma-separated override")
+    s.add_argument("--symbols", help="comma-separated override (also accepts the full_nse marker)")
     s.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
     s.add_argument("--interval", help="yfinance TF: 1m,5m,15m,30m,1h,1d,1wk,1mo (overrides config)")
+    s.add_argument("--refresh-universe", action="store_true",
+                   help="ignore the cached full-NSE list and fetch it again")
     s.add_argument("--dry-run", action="store_true", help="print Telegram messages instead of sending")
     s.add_argument("--no-dry-run", dest="no_dry_run", action="store_true",
                    help="force real Telegram sends even if telegram.dry_run is true in config")
@@ -233,17 +264,21 @@ def main(argv=None):
     b = sub.add_parser("backtest", help="backtest the alert signals")
     b.add_argument("--strategy", choices=["essl_ob_tap", "ob_tap", "essl_sweep"])
     b.add_argument("--rr", type=float, help="take-profit in R multiples (0 disables)")
-    b.add_argument("--symbols", help="comma-separated override")
+    b.add_argument("--symbols", help="comma-separated override (also accepts the full_nse marker)")
     b.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
     b.add_argument("--interval", help="yfinance TF (overrides config)")
     b.add_argument("--start", help="YYYY-MM-DD")
     b.add_argument("--bars", type=int, help="max bars per symbol")
+    b.add_argument("--refresh-universe", action="store_true",
+                   help="ignore the cached full-NSE list and fetch it again")
     b.set_defaults(fn=cmd_backtest)
 
     r = sub.add_parser("report", help="current zones / eSSL levels / recent events")
-    r.add_argument("--symbol", help="one symbol or comma list (default: all)")
+    r.add_argument("--symbol", help="one symbol or comma list (default: all; also accepts the full_nse marker)")
     r.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
     r.add_argument("--interval", help="yfinance TF (overrides config)")
+    r.add_argument("--refresh-universe", action="store_true",
+                   help="ignore the cached full-NSE list and fetch it again")
     r.set_defaults(fn=cmd_report)
 
     t = sub.add_parser("test-telegram", help="send a test Telegram message")
@@ -253,7 +288,7 @@ def main(argv=None):
     t.set_defaults(fn=cmd_test_telegram)
 
     g = sub.add_parser("diagnose", help="why is the scanner (not) alerting? live state per symbol")
-    g.add_argument("--symbols", help="comma-separated override (default: config.yaml)")
+    g.add_argument("--symbols", help="comma-separated override (default: config.yaml; also accepts the full_nse marker)")
     g.add_argument("--source", choices=["yahoo", "csv", "synthetic"])
     g.add_argument("--interval", help="yfinance TF (overrides config)")
     g.add_argument("--at", help="pretend the market clock is this 'YYYY-MM-DD HH:MM' (IST)")
@@ -261,6 +296,8 @@ def main(argv=None):
                    help="treat the last bar as a still-forming (LIVE) bar")
     g.add_argument("--json", action="store_true", help="machine-readable output")
     g.add_argument("--bars", type=int, help="cap bars per symbol (default: everything the feed gives)")
+    g.add_argument("--refresh-universe", action="store_true",
+                   help="ignore the cached full-NSE list and fetch it again")
     g.set_defaults(fn=cmd_diagnose)
 
     d = sub.add_parser("sample-data", help="generate offline synthetic CSVs into data/")
@@ -269,7 +306,9 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     _set_logging(args.verbose)
-    print(f"fpfssl {__version__} — FOOTPRINT ESSL v8.2 port")
+    # machine-readable output must be pure JSON — no banner line
+    if not (args.cmd == "diagnose" and getattr(args, "json", False)):
+        print(f"fpfssl {__version__} — FOOTPRINT ESSL v8.2 port")
     args.fn(args)
 
 

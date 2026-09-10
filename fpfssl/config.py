@@ -137,8 +137,23 @@ class DataConfig:
     interval: str = "1d"                 # yfinance TF: 1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo
     period: str | None = None            # yfinance period override (auto from interval when None)
     prepost: bool = False                # include pre/post market (NSE: keep False)
-    start: str | None = None             # backtest start date (YYYY-MM-DD)
+    start: str | None = None             # optional window start (YYYY-MM-DD); None = full history
     end: str | None = None
+    # 100%-parity with the TradingView indicator: the Pine script runs on the
+    # EXCHANGE's raw (unadjusted) NSE prices, so the feed must too. Adjusted
+    # OHLC (splits/dividends) shifts every level the indicator would draw.
+    auto_adjust: bool = False            # False = raw exchange OHLC (matches the chart)
+    # Full-universe yahoo fetching: yfinance makes one HTTP request per
+    # ticker, so a full-NSE pass is thousands of requests. `batch` fetches all
+    # symbols of a scan pass in one go (threaded); batch_size paces the
+    # requests in groups with batch_delay_sec between them.
+    batch: bool = True                   # fetch every symbol of a pass together
+    batch_size: int = 100                # symbols per download group (pacing only)
+    batch_threads: int = 8               # concurrent ticker requests
+    batch_delay_sec: float = 0.5         # pause between groups (Yahoo courtesy)
+    # full_nse universe resolution (see fpfssl/universe.py)
+    universe_cache_file: str = "data/nse_universe.csv"
+    universe_max_age_days: float = 7.0   # reuse the cached symbol list this long
     tick_overrides: dict[str, float] = field(default_factory=dict)  # symbol -> tick size
 
     def is_intraday(self) -> bool:
@@ -148,7 +163,7 @@ class DataConfig:
 
 @dataclass
 class ScannerConfig:
-    poll_minutes: float = 15.0
+    poll_minutes: float = 15.0           # daily cadence (intraday TFs can go lower)
     state_file: str = "state/scanner_state.json"
     alert_events: list[str] = field(default_factory=lambda: [
         "essl_ob_tap",    # composite: eSSL tap on a bar where a footprint TAP also fires (ALL RULES)

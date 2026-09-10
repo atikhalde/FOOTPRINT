@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from .config import AppConfig
-from .data import DataError, load_symbol
+from .data import DataError, load_all, load_symbol
 from .engine import Engine, detect_tick
 from .events import (
     K_DEFENCE,
@@ -283,14 +283,15 @@ class LiveScanner:
         return ok
 
     # -- single symbol pass ----------------------------------------------------
-    def scan_symbol(self, sym: str) -> int:
+    def scan_symbol(self, sym: str, df: pd.DataFrame | None = None) -> int:
         cfg = self.cfg
         tf = timeframe_label(cfg.data.interval)
-        try:
-            df = load_symbol(sym, cfg.data)
-        except DataError as e:
-            log.warning("%s: %s", sym, e)
-            return 0
+        if df is None:
+            try:
+                df = load_symbol(sym, cfg.data)
+            except DataError as e:
+                log.warning("%s: %s", sym, e)
+                return 0
         if len(df) < cfg.scanner.min_bars:
             log.info("%s: only %d bars (< %d), skipped", sym, len(df), cfg.scanner.min_bars)
             return 0
@@ -399,11 +400,33 @@ class LiveScanner:
     def scan_once(self) -> int:
         t0 = time.time()
         total = 0
+        # One batched yahoo fetch for the whole universe (full-NSE daily pass
+        # = thousands of tickers: per-symbol fetches would crawl). Each symbol
+        # then runs the engine over the same frame the per-symbol path would
+        # have fetched, so signals are identical — only the transport differs.
+        frames: dict[str, pd.DataFrame] = {}
+        if self.cfg.data.source == "yahoo" and len(self.symbols) > 1 and self.cfg.data.batch:
+            try:
+                frames = load_all(self.symbols, self.cfg.data)
+            except DataError as e:  # noqa: BLE001
+                log.error("batch load failed: %s", e)
+            log.info("fetched %d/%d symbols in %.1fs",
+                     len(frames), len(self.symbols), time.time() - t0)
+        missing = 0
         for sym in self.symbols:
             try:
-                total += self.scan_symbol(sym)
+                if frames:
+                    df = frames.get(sym)
+                    if df is None:
+                        missing += 1
+                        continue  # no bars for this symbol (dead ticker etc.)
+                    total += self.scan_symbol(sym, df)
+                else:
+                    total += self.scan_symbol(sym)
             except Exception as e:  # noqa: BLE001
                 log.exception("symbol %s failed: %s", sym, e)
+        if missing:
+            log.info("%d symbol(s) returned no bars and were skipped", missing)
         if not self.cfg.telegram.dry_run:
             self._save_state()
         tf = timeframe_label(self.cfg.data.interval)

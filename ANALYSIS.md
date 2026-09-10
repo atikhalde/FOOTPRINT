@@ -424,3 +424,54 @@ sent, and nothing else in the pipeline complains. The CI workflow now passes
 `--no-dry-run` on real runs, `scan` warns loudly when Telegram is not
 configured, and `python -m fpfssl diagnose` prints the live state of every rule
 so a quiet session can be told apart from a broken one.
+
+## 11. Full NSE universe on daily TF — 100% chart parity
+
+The default live setup is **daily bars over the complete NSE equity list**,
+chosen so a scanner signal is the same signal the indicator shows on the chart.
+
+### 11.1 Universe: `full_nse`
+
+`symbols: [full_nse]` (markers: `full_nse`, `all_nse`, `nse`, `*`) expands to
+every NSE `EQ`-series stock (~2,000+ `.NS` tickers):
+
+* cached list from `data/nse_universe.csv` (TTL `universe_max_age_days`);
+* on a miss, NSE's official archive list (`EQUITY_L.csv`), then the Yahoo
+  screener (`exchange = NSI`), then the result is cached;
+* if every source fails and no cache exists the scanner **fails loudly** — a
+  silently smaller universe means silently missed alerts;
+* `--source csv` resolves the marker to the local CSVs, `synthetic` to the
+  built-in demo list, so offline runs stay offline (`tests/test_universe.py`).
+
+### 11.2 Transport: one paced batch per pass
+
+yfinance makes **one HTTP request per ticker** even for bulk downloads, so a
+per-symbol fetch of the full universe is thousands of sequential requests. Each
+scan pass now downloads every symbol in one threaded batch (`data.batch`,
+`batch_size`, `batch_threads`, `batch_delay_sec`), splits the `yf.download`
+frame back into per-symbol frames, and hands each to the same `scan_symbol`
+path the per-symbol fetch used. The engine sees **identical frames**, so the
+signals are identical by construction — the transport is the only thing that
+changed (`test_scanner_batch_path_same_alerts` pins message-level equality of
+the two paths).
+
+### 11.3 Data parity with the indicator
+
+The Pine script runs on TradingView's NSE feed, which is **unadjusted** and
+ticked at 0.05. To make the port's levels match the chart:
+
+* `data.auto_adjust: false` — raw exchange OHLC (adjusted series shifts every
+  OB/eSSL level after a dividend/split/bonus);
+* `.NS`/`.BO` tick = 0.05 (`syminfo.mintick`), resolved automatically;
+* daily data is fetched **from listing** (`period: max`) — the indicator's
+  state machines run from the first bar of the chart, and the only faithful
+  port of that is the same history (`max_bars: 0` keeps it all).
+
+### 11.4 Daily session handling
+
+The engine and the scanner are timeframe-agnostic; the daily path only changes
+the clock wrappers: the last daily bar is LIVE (provisional) while the NSE
+session is open plus a settle buffer, `poll_minutes: 15` paces the pass, and
+the confirmed follow-up for the closing bar fires on the next trading day
+inside `recent_bars`. The stale/lag guards stay, and weekends count as zero
+trading days.

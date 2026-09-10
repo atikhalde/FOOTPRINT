@@ -4,10 +4,10 @@ A bar-for-bar Python port of the Pine v6 indicator
 **"Footprint Source TAP + Fresh SSL + Developing Preview v8.2"**
 (`FOOTPRINT ESSL.txt`), running on the **live Indian market (NSE/BSE) via yfinance**:
 
-* a **live market scanner** on any timeframe (`15m` default, `1d` supported) that sends
-  **Telegram alerts** whenever, in *any* watched stock, price **taps an eSSL level with
-  all the remaining rules matched** (a confirmed footprint OB's source-TAP condition fires
-  on the same bar), plus defence / sweep / invalidation alerts;
+* a **live market scanner** over the **FULL NSE equity universe** (default: **daily TF**)
+  that sends **Telegram alerts** whenever, in *any* watched stock, price **taps an eSSL
+  level with all the remaining rules matched** (a confirmed footprint OB's source-TAP
+  condition fires on the same bar), plus defence / sweep / invalidation alerts;
 * a **backtest engine** that trades exactly those signals (next-open entry, OB stop,
   R-multiple target, time exit) with full statistics;
 * a **report** command to inspect live zones, eSSL levels and FRESH lows at any time.
@@ -25,7 +25,7 @@ definitions — the Pine script itself has no alerts.
 
 ---
 
-## Quickstart — live NSE on 15m
+## Quickstart — live NSE, daily TF, full universe
 
 ```bash
 # 1. Python environment
@@ -38,25 +38,59 @@ export TELEGRAM_BOT_TOKEN="123456:ABC-..."      # or set in config.yaml
 export TELEGRAM_CHAT_ID="123456789"
 python -m fpfssl test-telegram                  # must print a message ✅
 
-# 3. Live NSE scanner (default: 15m bars, 5-min polling, IST market clock)
-python -m fpfssl scan                           # runs forever (Ctrl-C to stop)
+# 3. Live NSE scanner (default: DAILY bars, FULL NSE universe, 15-min polling)
+python -m fpfssl scan                           # runs the session (Ctrl-C to stop)
 python -m fpfssl scan --once                    # single pass, then exit
 python -m fpfssl scan --once --dry-run          # print what would be sent
+python -m fpfssl scan --symbols RELIANCE.NS,TCS.NS   # subset instead of full_nse
 
 # 4. Backtest the alert signals (default strategy: essl_ob_tap)
-python -m fpfssl backtest                       # 15m NSE universe
+python -m fpfssl backtest                       # daily, full NSE universe
 python -m fpfssl backtest --strategy ob_tap     # TAP on any confirmed FP-OB
-python -m fpfssl backtest --interval 1d         # daily timeframe instead
+python -m fpfssl backtest --interval 15m        # intraday timeframe instead
 
 # 5. Introspect current state (zones / eSSL levels / FRESH lows / recent events)
 python -m fpfssl report --symbol RELIANCE.NS
-python -m fpfssl report --symbol RELIANCE.NS --interval 1d
+python -m fpfssl report --symbol RELIANCE.NS --interval 15m
 
 # 6. "Why is it not alerting?" — the live state behind every rule, per symbol
 python -m fpfssl diagnose                      # armed FP-OBs, eSSL levels, distance to price
 python -m fpfssl diagnose --at "2026-09-10 12:00"   # replay an earlier clock
 python -m fpfssl diagnose --json > diag.json   # machine-readable
 ```
+
+### Full NSE universe (`full_nse`)
+
+`config.yaml` ships with `symbols: [full_nse]`. The marker expands to the
+**complete NSE equity list** (every `EQ`-series stock, ~2,000+ `.NS` tickers):
+
+1. cached list from `data/nse_universe.csv` (reused for
+   `data.universe_max_age_days`, default 7);
+2. otherwise NSE's official equity list (`EQUITY_L.csv`), falling back to the
+   Yahoo Finance screener (exchange `NSI`), then cached for next time.
+
+Add `--refresh-universe` to force a refetch. Explicit tickers can be mixed
+with the marker. For `--source csv` the marker means "every CSV in `data/`",
+and for `synthetic` it means the built-in demo list — both offline. If the
+universe cannot be fetched and no cache exists the scanner **fails loudly**
+instead of silently scanning a smaller list.
+
+### 100% match with the TradingView indicator
+
+The scanner is designed so a signal here is a signal on the chart:
+
+* **same timeframe** — default `interval: 1d` (daily), exactly the bars the
+  indicator sees on the chart;
+* **same prices** — `auto_adjust: false` fetches **raw exchange OHLC**
+  (TradingView NSE data is unadjusted; adjusted series shift every OB/eSSL
+  level after corporate actions);
+* **same tick** — NSE/BSE tick = 0.05 (`syminfo.mintick`), resolved
+  automatically per symbol;
+* **same history** — daily data is fetched from listing (`period: max`), so
+  the path-dependent state machines (footprint OBs, SSL pools) build the same
+  state as the indicator's full chart history;
+* **same engine** — the (A)→(G) per-bar ordering, arithmetic and state
+  transitions of `FOOTPRINT ESSL.txt` are ported 1:1 (see `ANALYSIS.md`).
 
 ### Getting Telegram credentials
 
@@ -163,7 +197,7 @@ confirmed. Weekends, holidays and feed lag are handled (stale symbols are skippe
 not alerted).
 
 ```bash
-# terminal (15m live)
+# terminal (daily, full NSE)
 nohup python -m fpfssl scan >> scanner.log 2>&1 &
 
 # or systemd (recommended) — /etc/systemd/system/fpfssl.service
@@ -185,9 +219,14 @@ WantedBy=multi-user.target
 Behaviour details:
 
 * **Timeframes** — `data.interval` selects the TradingView-equivalent TF
-  (`15m` default; `5m`/`30m`/`1h`/`1d` all run the identical state machines).
+  (`1d` default; `5m`/`15m`/`30m`/`1h` all run the identical state machines).
   Yahoo intraday windows apply (15m → last 60 days, 1m → last 7 days, 1h → last
-  730 days); the scanner requests the maximum window automatically.
+  730 days); the scanner requests the maximum window automatically. Daily data
+  is fetched from listing (`period: max`).
+* **Full universe fetching** — a full-NSE pass is thousands of yfinance
+  requests (one per ticker), so each scan pass downloads the whole universe in
+  one threaded, paced batch (`data.batch*` settings) and then runs the engine
+  per symbol over the same frames — identical signals, one transport.
 * **History is never trimmed** — the engine runs over *every* bar the feed
   serves (`data.max_bars` is the only cap, `0` = keep everything). The
   footprint/TAP state machine is path-dependent: a zone born several hundred
@@ -197,10 +236,13 @@ Behaviour details:
   `tests/test_live_scanner.py`, whose regression case is a composite whose zone
   is 685 bars old). `history_bars` is a *minimum window* hint, `min_bars` is
   the skip threshold for feeds that are too short to warm the engine up.
-* **Polling** — every `scanner.poll_minutes` (default 5 for 15m), each symbol's
-  history is re-run through the engine. Because the engine is *stateless per pass*
-  (it rebuilds all state from history), forming-bar updates roll back naturally —
-  exactly like Pine's live last bar.
+* **Raw prices** — `data.auto_adjust: false` (default) feeds the engine the
+  same unadjusted OHLC the TradingView indicator sees, so OB/eSSL levels match
+  the chart exactly (including after dividends/splits/bonuses).
+* **Polling** — every `scanner.poll_minutes` (default 15 for daily), each
+  symbol's history is re-run through the engine. Because the engine is
+  *stateless per pass* (it rebuilds all state from history), forming-bar
+  updates roll back naturally — exactly like Pine's live last bar.
 * **Provisional vs confirmed** — events on the still-forming bar are sent with a
   `LIVE (intraday bar — provisional)` tag, immediately when the bar is still
   forming. The closed bar has a separate dedupe key, so it *may* alert again —
@@ -260,14 +302,16 @@ exact rate for your universe:
 
 | `data.source` | where it's used | notes |
 |---|---|---|
-| `yahoo` | **live use (default)** | 15m/daily bars via `yfinance`; works on any machine with internet. NSE `.NS`, BSE `.BO`, US as-is. |
-| `csv` | offline / own data | `data/<SYMBOL>.csv` with header `date,open,high,low,close,volume` (intraday: `date` may include `HH:MM`). Great for data you already have. |
+| `yahoo` | **live use (default)** | daily (default) or intraday bars via `yfinance`, **raw unadjusted OHLC** (`auto_adjust: false`) so levels match the chart; full daily history from listing. `full_nse` universe fetched in one paced batch. NSE `.NS`, BSE `.BO`, US as-is. |
+| `csv` | offline / own data | `data/<SYMBOL>.csv` with header `date,open,high,low,close,volume` (intraday: `date` may include `HH:MM`). Great for data you already have. With `full_nse` the marker scans every CSV present in `data/`. |
 | `synthetic` | demos/tests in sealed environments | deterministic regime-switching generator (daily, or session-stamped 15m when the interval is intraday). **Not real data — never trade or draw conclusions from it.** |
 
 > **Feed latency**: Yahoo's NSE intraday quotes are delayed (~15 min) and bars
 > can print late, so a live alert can trail the tape by that much. Polling uses
 > `scanner.max_lag_minutes` to skip a symbol whose feed has genuinely stalled,
-> and `poll_minutes` controls how often a forming bar is re-read.
+> and `poll_minutes` controls how often a forming bar is re-read. Daily bars
+> settle once per session, so the daily scanner polls through the session and
+> re-checks the closing bar until `stop_after_close_minutes` after 15:30 IST.
 
 ## Backtest engine
 
