@@ -128,9 +128,16 @@ class DataConfig:
     source: str = "yahoo"                # yahoo | csv | synthetic
     csv_dir: str = "data"
     history_bars: int = 500              # bars to keep for the scanner
+    interval: str = "1d"                 # yfinance TF: 1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo
+    period: str | None = None            # yfinance period override (auto from interval when None)
+    prepost: bool = False                # include pre/post market (NSE: keep False)
     start: str | None = None             # backtest start date (YYYY-MM-DD)
     end: str | None = None
     tick_overrides: dict[str, float] = field(default_factory=dict)  # symbol -> tick size
+
+    def is_intraday(self) -> bool:
+        # yfinance: 1m = 1 minute (intraday), 1mo = 1 month (not intraday)
+        return self.interval.lower() not in ("1d", "d", "1wk", "1w", "1mo", "daily")
 
 
 @dataclass
@@ -145,10 +152,15 @@ class ScannerConfig:
         "zone_invalid",   # zone invalidated (stop) or touch limit exceeded
         "essl_created",   # new eSSL reference published (fresh major low)
     ])
-    provisional_alerts: bool = True      # also alert on the still-forming intraday bar (marked LIVE)
+    provisional_alerts: bool = True      # also alert on the still-forming bar (marked LIVE)
     alert_cooldown_minutes: float = 60.0
     min_bars: int = 300                  # skip symbols with too little history (engine warmup)
-    max_stale_days: int = 4              # skip symbols whose last bar is older than this
+    max_stale_days: int = 4              # skip symbols whose last bar is older than this (trading-day aware)
+    max_lag_minutes: int = 90            # intraday: skip when market is open but feed lags more than this
+    market_timezone: str = "Asia/Kolkata"  # NSE/BSE live clock (IST)
+    market_open: str = "09:15"           # NSE equity session open (IST, HH:MM)
+    market_close: str = "15:30"          # NSE equity session close (IST, HH:MM)
+    recent_bars: int = 3                 # only the last N bars can raise new alerts
 
 
 @dataclass
@@ -183,10 +195,9 @@ class AppConfig:
     backtest: BacktestConfig = field(default_factory=BacktestConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     symbols: list[str] = field(default_factory=lambda: [
-        # US large caps
-        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "JPM", "XOM", "WMT",
-        # NSE large caps (Yahoo suffix .NS)
-        "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "SBIN.NS",
+        # NSE large caps (Yahoo suffix .NS) — live Indian market universe
+        "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS",
+        "SBIN.NS", "ITC.NS", "BHARTIARTL.NS", "LT.NS", "ASIANPAINT.NS",
     ])
 
 

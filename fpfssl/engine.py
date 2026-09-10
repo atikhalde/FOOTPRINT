@@ -63,13 +63,13 @@ def rma(x: np.ndarray, length: int) -> np.ndarray:
 
 
 def sma(x: np.ndarray, length: int) -> np.ndarray:
-    n = len(x)
-    out = np.full(n, np.nan)
-    if n < length:
-        return out
-    csum = np.cumsum(np.insert(x, 0, 0.0))
-    out[length - 1:] = (csum[length:] - csum[:-length]) / length
-    return out
+    """ta.sma: mean of the last `length` values, na until `length` valid bars.
+
+    Uses pandas rolling (min_periods=length) so a single NaN only poisons its
+    own window — matching Pine — instead of poisoning all later bars the way
+    a raw cumsum would.
+    """
+    return pd.Series(x).rolling(length, min_periods=length).mean().to_numpy()
 
 
 def roll_min(x: np.ndarray, length: int) -> np.ndarray:
@@ -96,20 +96,39 @@ def floor_tick(x: float, tick: float) -> float:
     return math.floor(x / tick + 1e-7) * tick
 
 
-def detect_tick(df: pd.DataFrame) -> float:
-    """Infer the symbol tick size from price decimals (fallback 0.01)."""
-    vals = []
+def detect_tick(df: pd.DataFrame, symbol: str = "") -> float:
+    """Resolve the symbol tick size (Pine syminfo.mintick).
+
+    Exchange-first, data-second:
+    * NSE (.NS) / BSE (.BO) equities trade in 0.05 ticks. Detecting from
+      yfinance auto-adjusted prices would return a spurious 0.01 (or smaller),
+      which corrupts every tick-based rule (penetration, rounding, buffers).
+    * Otherwise infer from price decimals, floored at 0.01 so adjusted closes
+      with sub-penny fractions still map to a sane tick.
+    Explicit per-symbol overrides in config (tick_overrides) win over this.
+    """
+    sym = (symbol or "").upper()
+    if sym.endswith(".NS") or sym.endswith(".BO"):
+        return 0.05
+    vals: list[float] = []
     for col in ("open", "high", "low", "close"):
         if col in df.columns:
             vals.extend(df[col].dropna().tolist())
     if not vals:
         return 0.01
-    a = np.array(sorted(set(round(v, 9) for v in vals)))
+    a = np.array(sorted(set(round(float(v), 6) for v in vals)))
     diffs = np.diff(a)
     diffs = diffs[diffs > 1e-9]
     if len(diffs) == 0:
         return 0.01
-    return float(round(min(diffs), 9))
+    md = float(np.min(diffs))
+    if md < 0.005:  # adjusted-price dust -> standard equity tick
+        return 0.01
+    # snap to a standard tick grid when very close to one
+    for std in (0.01, 0.05, 0.10, 0.25, 0.50, 1.0):
+        if abs(md - std) / std < 0.02:
+            return std
+    return float(round(md, 6))
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +337,20 @@ class Engine:
         l = df["low"].to_numpy(float)
         c = df["close"].to_numpy(float)
         v = df["volume"].to_numpy(float)
-        dates = [d.strftime("%Y-%m-%d") for d in df.index]
+        # Daily bars -> "YYYY-MM-DD" (Pine date display); intraday bars keep
+        # their session time -> "YYYY-MM-DD HH:MM" so every bar stays unique
+        # for grouping, dedup keys and Telegram messages.
+        tf_u = (self.tf or "").upper()
+        # yfinance: 1m = 1 minute (intraday), 1mo = 1 month. Upper() maps the
+        # minute TF to "1M", so it must NOT be in the daily-or-above set.
+        intraday_tf = tf_u not in ("", "1D", "D", "DAILY", "1W", "1WK", "1MO")
+        if not intraday_tf:
+            try:
+                intraday_tf = bool(((df.index.hour != 0) | (df.index.minute != 0)).any())
+            except Exception:  # noqa: BLE001
+                intraday_tf = False
+        fmt = "%Y-%m-%d %H:%M" if intraday_tf else "%Y-%m-%d"
+        dates = [pd.Timestamp(d).strftime(fmt) for d in df.index]
         n = len(df)
         self._open, self._high, self._low, self._close, self._dates = o, h, l, c, dates
         tick = self.tick
@@ -335,8 +367,12 @@ class Engine:
 
         volma = sma(v, cfg.volume_length)
         prior_volma = np.roll(volma, 1); prior_volma[0] = np.nan
-        valid_vol = pd.Series(v).where(v >= 0, 0.0).rolling(cfg.volume_length, min_periods=1).sum().to_numpy()
-        base_valid_vol = pd.Series(v).where(v >= 0, 0.0).rolling(cfg.evidence_window, min_periods=1).sum().to_numpy()
+        # Pine: math.sum(not na(volume) and volume >= 0 ? 1.0 : 0.0, length)
+        # = a COUNT of valid-volume bars (na until `length` bars), NOT a sum
+        # of volumes. min_periods=length reproduces the na warmup exactly.
+        _valid = pd.Series(((~np.isnan(v)) & (v >= 0)).astype(float))
+        valid_vol = _valid.rolling(cfg.volume_length, min_periods=cfg.volume_length).sum().to_numpy()
+        base_valid_vol = _valid.rolling(cfg.evidence_window, min_periods=cfg.evidence_window).sum().to_numpy()
         support = roll_min(l, cfg.support_length)
         support1 = np.roll(support, 1); support1[0] = np.nan
 
@@ -346,15 +382,14 @@ class Engine:
             src_rvol = np.where(src_volma > 0, v / np.where(np.isnan(src_volma), np.nan, src_volma), 0.0)
         src_range = np.maximum(h - l, tick)
         clv = (c - l) / src_range
-        # ta.lowest(low[1], k): k previous bars (excluding current)
-        l_prev = np.roll(l, 1)
-        src_prior_low = np.full(n, np.nan)
-        if n > 1:
-            src_prior_low[1:] = pd.Series(l_prev[1:]).rolling(cfg.source_sweep_length, min_periods=cfg.source_sweep_length).min().to_numpy()
-        h_prev = np.roll(h, 1)
-        src_micro_high = np.full(n, np.nan)
-        if n > 1:
-            src_micro_high[1:] = pd.Series(h_prev[1:]).rolling(cfg.source_confirm_bos_length, min_periods=cfg.source_confirm_bos_length).max().to_numpy()
+        # ta.lowest(low[1], k) / ta.highest(high[1], k): k previous bars
+        # (excluding current) -> lowest/highest of l[t-k..t-1] / h[t-k..t-1].
+        src_prior_low = (
+            pd.Series(l).shift(1).rolling(cfg.source_sweep_length, min_periods=cfg.source_sweep_length).min().to_numpy()
+        )
+        src_micro_high = (
+            pd.Series(h).shift(1).rolling(cfg.source_confirm_bos_length, min_periods=cfg.source_confirm_bos_length).max().to_numpy()
+        )
 
         body = np.abs(c - o)
         rng = h - l
@@ -566,6 +601,9 @@ class Engine:
                             stop_setup(f, "Buffered break response expired or failed")
 
             # (B) SSL lifecycle + emission --------------------------------------
+            # Pine state transitions are reproduced verbatim; the group-8 tap
+            # EVENT is emitted on EVERY qualifying bar (a repeat visit is still
+            # a tap), independent of the TOUCHED/PARTIAL latch.
             if confirmed and cfg.ssl_enabled:
                 for p in pools:
                     if p.active and t > p.born_bar:
@@ -585,11 +623,13 @@ class Engine:
                             elif c[t] < p.lower - eps:
                                 final = CLOSED_BELOW
                             age_bars = t - p.born_bar
+                            # Pine counts reclaims/recoveries/breaks for BOTH scopes.
                             if final in (SWEEP, GAP_RECLAIM):
                                 self._ssl_events.append({
                                     "bar": t, "scope": p.scope, "state": final,
                                     "lower": p.lower, "upper": p.upper, "pool_id": p.id,
                                 })
+                                counters["ssl_reclaims"] = counters.get("ssl_reclaims", 0) + 1
                                 if p.scope == 1:
                                     emit(K_ESSL_SWEEP, t, pool_id=p.id, price=p.lower,
                                          low=l[t], close=c[t], penetrated=True,
@@ -597,7 +637,6 @@ class Engine:
                                          members=p.members, age_bars=age_bars,
                                          origin_date=dates[p.first_origin],
                                          classification=SSL_STATE_NAMES[final])
-                                    counters["ssl_reclaims"] = counters.get("ssl_reclaims", 0) + 1
                             elif final == RECOVERY:
                                 counters["ssl_recoveries"] = counters.get("ssl_recoveries", 0) + 1
                             else:
@@ -620,26 +659,22 @@ class Engine:
                         elif t - p.born_bar >= cfg.ssl_max_age:
                             finish_pool(p, EXPIRED, t)
                         elif overlap:
+                            # Pine state latch (verbatim)
                             if l[t] < p.upper - eps:
-                                if p.state != PARTIAL and p.scope == 1:
-                                    emit(K_ESSL_TAP, t, pool_id=p.id, price=p.lower,
-                                         low=l[t], close=c[t], penetrated=True,
-                                         depth=max(p.lower - l[t], 0.0),
-                                         reclaimed=bool(c[t] >= p.upper + cfg.ssl_reclaim_ticks * tick - eps),
-                                         members=p.members, age_bars=t - p.born_bar,
-                                         origin_date=dates[p.first_origin],
-                                         classification="Partial penetration")
                                 p.state = PARTIAL
                             elif p.state == UNBREACHED:
                                 p.state = TOUCHED
-                                if p.scope == 1:
-                                    emit(K_ESSL_TAP, t, pool_id=p.id, price=p.lower,
-                                         low=l[t], close=c[t], penetrated=False,
-                                         depth=0.0,
-                                         reclaimed=bool(c[t] >= p.upper + cfg.ssl_reclaim_ticks * tick - eps),
-                                         members=p.members, age_bars=t - p.born_bar,
-                                         origin_date=dates[p.first_origin],
-                                         classification="Touched")
+                            # Group-8 event: EVERY overlap of an active eSSL is a
+                            # tap (touch / partial), not just the first latch.
+                            if p.scope == 1:
+                                partial = bool(l[t] < p.upper - eps)
+                                emit(K_ESSL_TAP, t, pool_id=p.id, price=p.lower,
+                                     low=l[t], close=c[t], penetrated=partial,
+                                     depth=max(p.lower - l[t], 0.0) if partial else 0.0,
+                                     reclaimed=bool(c[t] >= p.upper + cfg.ssl_reclaim_ticks * tick - eps),
+                                     members=p.members, age_bars=t - p.born_bar,
+                                     origin_date=dates[p.first_origin],
+                                     classification="Partial penetration" if partial else "Touched")
                 # external range bookkeeping
                 if ssl_major_low is not None and c[t] < ssl_major_low - eps:
                     ssl_range_broken = True
@@ -864,9 +899,12 @@ class Engine:
                     and base_valid_vol[t] >= cfg.evidence_window
                     and not math.isnan(volma[t - cfg.evidence_window]) and volma[t - cfg.evidence_window] > 0
                 )
-                base_atr = atr[t - cfg.evidence_window]
-                base_vol = volma[t - cfg.evidence_window]
-                base_sup = support[t - cfg.evidence_window]
+                if t >= cfg.evidence_window:
+                    base_atr = atr[t - cfg.evidence_window]
+                    base_vol = volma[t - cfg.evidence_window]
+                    base_sup = support[t - cfg.evidence_window]
+                else:  # Pine series[window] is na before `window` bars exist
+                    base_atr = base_vol = base_sup = float("nan")
                 repeated = False
                 observations, rule = 1, "Single high-volume rejection / absorption-style proxy"
                 evidence_ratio = 0.0
@@ -948,13 +986,13 @@ class Engine:
                             break
                     rem = zones.pop(idx)
                     if rem.active:
+                        # Administrative retirement (Pine f_retireZone+f_deleteZone
+                        # with "Record cap, no longer tracked"). Silent: NOT a
+                        # stop/tap-limit invalidation, so no alert event.
                         rem.active = False
                         rem.source_state = -1
                         rem.terminal_reason = "Record cap, no longer tracked"
                         rem.ended_bar = t
-                        emit(K_ZONE_INVALID, t, zone_id=rem.id, price=c[t],
-                             reason=rem.terminal_reason, close=c[t], stop=rem.invalidation,
-                             taps=rem.source_taps, state="OLD")
 
             # (G) LIVE source-TAP state machine (every bar, forming included) ------
             for z in zones:

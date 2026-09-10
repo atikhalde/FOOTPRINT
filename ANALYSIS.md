@@ -4,7 +4,8 @@
 
 This document is a complete, section-by-section analysis of the indicator, its state
 machines, its exact arithmetic, and its guarantees — and how the Python port in this
-repository reproduces it bar-for-bar on the **daily timeframe**.
+repository reproduces it bar-for-bar on **any timeframe** (daily or intraday —
+the Pine script is timeframe-agnostic and so is the port).
 
 ---
 
@@ -320,7 +321,7 @@ Everything above is ported 1:1 (verified by the hand-crafted scenario suite in
 1. **eSSL tap events** — the source has *no alerts*. The port emits `essl_tap`
    (touch / partial / full penetration, with the script's own penetration & reclaim
    definitions), `essl_sweep`, and `essl_break` so the scanner can alert.
-2. **The composite ALL-RULES signal** (`essl_ob_tap`): on one daily bar, an active
+2. **The composite ALL-RULES signal** (`essl_ob_tap`): on one bar, an active
    eSSL level is tapped **and** a confirmed FP-OB's source-TAP condition fires —
    i.e. *price taps the eSSL level with all the remaining rules matched*. This is the
    primary Telegram alert and the primary backtest strategy.
@@ -347,7 +348,7 @@ Known-faithful edge behaviours preserved (each has a test or code comment):
   quantity at price. Identity, resting quantity, and fills are unknown.
 * **Reference-based TAP**: `low ≤ reference` is a price condition; the reference can
   sit above the zone and a "TAP" is not a verified OB overlap or fill.
-* **Pivot confirmation lag**: eSSL recognition lags its origin by 10 daily bars;
+* **Pivot confirmation lag**: eSSL recognition lags its origin by 10 bars;
   iSSL by 3. Levels are therefore always slightly stale by design.
 * **OHLCV-only**: gaps, halts, corporate actions arrive as raw bars; the script has no
   adjustment logic beyond what the data feed provides.

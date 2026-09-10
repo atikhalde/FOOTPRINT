@@ -1,7 +1,7 @@
-"""Backtest engine for FPFSSL8.2 daily signals.
+"""Backtest engine for FPFSSL8.2 signals (any timeframe via data.interval).
 
 Strategies (entry on the NEXT bar's open by default — the signal is known at
-the bar close, exactly as a daily-TF user acts):
+the bar close, exactly as the indicator user acts):
 
   essl_ob_tap  (default)  price TAPPED an eSSL level on a bar where a
                           footprint-source TAP also fired = the "ALL RULES"
@@ -91,9 +91,11 @@ def run_backtest(
     n_ok = 0
 
     # the engine needs warmup history BEFORE the trading window; make sure the
-    # data fetch starts early enough (ATR/MA seed, pivots, baselines)
+    # data fetch starts early enough (ATR/MA seed, pivots, baselines).
+    # NB: Yahoo caps intraday lookback (60d for 15m, 7d for 1m), so for
+    # intraday the warmup is bounded by what the feed serves.
     fetch_cfg = copy.deepcopy(data_cfg)
-    if bt.start:
+    if bt.start and not fetch_cfg.is_intraday():
         need_start = pd.Timestamp(bt.start) - pd.Timedelta(days=200)
         cur = pd.Timestamp(fetch_cfg.start) if fetch_cfg.start else None
         if cur is None or cur > need_start:
@@ -106,17 +108,18 @@ def run_backtest(
             print(f"  ! {sym}: data error: {e}")
             continue
         n_ok += 1
-        # trading window: signals only from bt.start, but keep ~180 days of
-        # warmup BEFORE start so ATR/MA/pivot state is fully warmed (event
-        # bar indices stay aligned with this df — the engine runs on it)
+        # trading window: signals only from bt.start, but keep warmup BEFORE
+        # start so ATR/MA/pivot state is fully warmed (event bar indices stay
+        # aligned with this df — the engine runs on it)
         if bt.start:
-            warm_start = pd.Timestamp(bt.start) - pd.Timedelta(days=180)
+            warm_days = 30 if fetch_cfg.is_intraday() else 180
+            warm_start = pd.Timestamp(bt.start) - pd.Timedelta(days=warm_days)
             df = df[df.index >= warm_start]
             trade_from = int(df.index.searchsorted(pd.Timestamp(bt.start)))
         else:
             trade_from = 0
-        tick = data_cfg.tick_overrides.get(sym, detect_tick(df))
-        eng = Engine(sym, engine_cfg, tick)
+        tick = data_cfg.tick_overrides.get(sym, detect_tick(df, sym))
+        eng = Engine(sym, engine_cfg, tick, tf=data_cfg.interval)
         res = eng.run(df, live_last_bar=False)
         for ev in res.events:
             event_rows.append({
@@ -134,7 +137,7 @@ def run_backtest(
         sigs = {t: v for t, v in _signals_by_bar(res, bt.strategy, bt.entry_tap).items() if t >= trade_from}
         o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
         atr = res.atr
-        dates = [d.strftime("%Y-%m-%d") for d in df.index]
+        dates = list(res.dates)  # engine datestamps (intraday keeps HH:MM)
         n = len(df)
 
         in_trade_until = -1
@@ -290,7 +293,7 @@ def format_summary(s: dict) -> str:
             f"expectancy         : {s['expectancy_r']} R per trade",
             f"total return       : {s['total_return_pct']}% (compounded, per-trade risk model)",
             f"max drawdown       : {s['max_drawdown_pct']}%",
-            f"sharpe (daily eq)  : {s['sharpe']}",
+            f"sharpe (per-trade eq): {s['sharpe']}",
             f"avg bars held      : {s['avg_bars']}",
             f"exits              : {s['exits']}",
         ]
