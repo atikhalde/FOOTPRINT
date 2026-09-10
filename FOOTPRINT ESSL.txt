@@ -1,0 +1,1560 @@
+//@version=6
+indicator("Footprint Source TAP + Fresh SSL + Developing Preview v8.2", shorttitle="FPFSSL8.2", overlay=true,
+     max_bars_back=2000, max_boxes_count=180, max_lines_count=450, max_labels_count=450)
+
+// PRIMARY OUTPUT: footprint-supported bullish OBs, not generic structure OBs.
+// Footprint zones are created only at confirmed closes; pending setups are hidden.
+// Source-compatible TAP/approach/invalidity run LIVE and are provisional intrabar.
+// Defence remains close-confirmed, exactly as in the supplied TAP block.
+// OHLCV evidence is a proxy: institutional identity, hidden quantity, actual
+// volume at a price, remaining orders and broker fills are NOT observed.
+// Required: earlier footprint, first-departure origin, strong displacement,
+// and a buffered break of a frozen known high. Draw only after ALL are known.
+// First-departure origin and geometry never move during later confirmation.
+// SSL is optional CONTEXT, never a mandatory footprint/OB gate.
+// No table, large status label, five-phase layer, generic OB fallback or alerts.
+// v7.1: independent live iSSL/eSSL price tracks and stronger nearest labels.
+// v8.1 restores the supplied Precision Tap reference arithmetic and per-bar
+// state machine, including immediate TAP-1 adjustment, timeout state reset and
+// invalidity AFTER TAP/defence. This intentionally replaces the v8 episode model.
+// No actual institutional identity, resting quantity or broker fill is observed.
+// v8.2: FRESH confirmed unswept lows are published independently of a complete
+// external range. A separate DEV SSL preview is explicitly UNCONFIRMED.
+// Original-source TAP formulas, ordering and live operation remain unchanged.
+
+const string G0 = "1 - Primary footprint evidence"
+int atrLength = input.int(14, "ATR length", minval=5, maxval=100, group=G0)
+int volumeLength = input.int(20, "Prior volume baseline bars", minval=5, maxval=100, group=G0)
+int supportLength = input.int(10, "Prior support-low lookback", minval=3, maxval=50, group=G0)
+float strongRVOL = input.float(1.50, "Single evidence bar: minimum RVOL", minval=1.0, maxval=5.0, step=0.1, group=G0)
+int evidenceWindow = input.int(5, "Repeated evidence window", minval=2, maxval=15, group=G0,
+     tooltip="Its ATR, support and volume baselines end BEFORE the entire window. The base cannot inflate its own reference baseline.")
+int minimumEvidenceBars = input.int(2, "Repeated evidence: minimum observations", minval=2, maxval=6, group=G0)
+float repeatedBarRVOL = input.float(1.05, "Repeated evidence: per-bar minimum RVOL", minval=0.5, maxval=3.0, step=0.05, group=G0)
+float repeatedMeanRVOL = input.float(1.20, "Repeated evidence: mean RVOL minimum", minval=0.5, maxval=4.0, step=0.05, group=G0)
+float maxEvidenceBody = input.float(0.50, "Maximum evidence body / baseline ATR", minval=0.1, maxval=1.5, step=0.05, group=G0)
+float maxEvidenceRange = input.float(1.50, "Maximum evidence range / baseline ATR", minval=0.5, maxval=4.0, step=0.1, group=G0)
+float maxDownsideProgress = input.float(0.50, "Maximum downside close change / baseline ATR", minval=0.1, maxval=2.0, step=0.05, group=G0,
+     tooltip="Includes the previous close, not merely the current candle body. A large gap-down with little intraday body is not automatically called absorption.")
+float evidenceCloseLocation = input.float(0.60, "Evidence minimum close location", minval=0.5, maxval=1.0, step=0.05, group=G0)
+float minimumLowerWick = input.float(0.20, "Evidence minimum lower wick / range", minval=0.0, maxval=0.8, step=0.05, group=G0)
+float supportDistanceATR = input.float(1.0, "Maximum distance above prior support / ATR", minval=0.1, maxval=3.0, step=0.1, group=G0)
+float maxBaseWidthATR = input.float(2.50, "Maximum complete footprint-base width / ATR", minval=0.5, maxval=5.0, step=0.1, group=G0)
+
+const string G1 = "2 - Required later price confirmation"
+string confirmationStructure = input.string("Internal", "Confirmed structure scale for the OB", options=["Internal", "External"], group=G1)
+int confirmationDeadline = input.int(20, "Maximum bars after footprint observation", minval=3, maxval=60, group=G1)
+float departureClearance = input.float(0.10, "First departure beyond base / footprint ATR", minval=0.0, maxval=1.0, step=0.05, group=G1)
+int displacementGrace = input.int(2, "Extra bars after departure for strong displacement", minval=0, maxval=5, group=G1)
+float minimumDisplacementRange = input.float(0.80, "Displacement minimum range / prior ATR", minval=0.3, maxval=3.0, step=0.05, group=G1)
+float minimumDisplacementBody = input.float(0.50, "Displacement minimum body / range", minval=0.2, maxval=1.0, step=0.05, group=G1)
+float displacementCloseLocation = input.float(0.65, "Displacement minimum close location", minval=0.5, maxval=1.0, step=0.05, group=G1)
+float breakClearance = input.float(0.05, "Structure / base clearance in footprint ATR", minval=0.0, maxval=1.0, step=0.01, group=G1)
+int breakGrace = input.int(2, "Extra confirmation bars after first buffered break", minval=0, maxval=5, group=G1)
+int maxPendingSetups = input.int(24, "Maximum internal footprint records", minval=4, maxval=40, group=G1)
+
+const string G2 = "3 - Footprint / opposing-origin formation"
+int originSearch = input.int(12, "Bearish-origin search before first departure", minval=1, maxval=30, group=G2)
+int originPadding = input.int(3, "Origin may precede first evidence by at most bars", minval=0, maxval=10, group=G2)
+int minimumLinkTicks = input.int(1, "Minimum actual overlap with footprint area (ticks)", minval=1, maxval=20, group=G2,
+     tooltip="Time and interval association are mandatory. The nearest bearish candle is frozen at the FIRST departure; an older nicer candle cannot be substituted after later failure.")
+int minimumWidthTicks = input.int(2, "Minimum OB width in ticks", minval=1, maxval=20, group=G2)
+float maxOBWidthATR = input.float(2.50, "Maximum OB width / departure ATR", minval=0.5, maxval=5.0, step=0.1, group=G2)
+string invalidationMode = input.string("Close", "Pre-creation footprint/origin failure uses completed", options=["Close", "Wick"], group=G2)
+float invalidationATR = input.float(0.10, "Pre-creation integrity buffer / frozen ATR", minval=0.0, maxval=1.0, step=0.05, group=G2)
+int invalidationTicks = input.int(1, "Pre-creation minimum integrity buffer (ticks)", minval=1, maxval=20, group=G2)
+float contactDepartureATR = input.float(0.50, "Pre-creation leg contact separation / departure ATR", minval=0.1, maxval=3.0, step=0.1, group=G2)
+int maxContacts = input.int(3, "Reject formation at this many prior contact episodes", minval=1, maxval=10, group=G2)
+int maxZones = input.int(12, "Maximum retained confirmed OB records", minval=1, maxval=30, group=G2)
+float duplicateOverlap = input.float(0.75, "Suppress overlap / smaller live zone", minval=0.2, maxval=1.0, step=0.05, group=G2)
+
+const string G3 = "4 - Chart-only presentation"
+bool showLevelLabels = input.bool(true, "Compact price tags on confirmed zones", group=G3)
+bool showMidpoint = input.bool(true, "Draw tick-rounded midpoint", group=G3)
+bool showInvalidation = input.bool(true, "Draw fixed source stop reference", group=G3)
+bool showPriceTracks = input.bool(true, "Current nearest live FP-OB price-scale tracks", group=G3)
+bool keepInactive = input.bool(true, "Keep confirmed historical zones (inactive gray)", group=G3)
+int projectionBars = input.int(25, "Right projection in chart bars", minval=5, maxval=100, group=G3)
+int labelOffset = input.int(3, "Price tag right offset", minval=1, maxval=20, group=G3)
+color zoneColor = input.color(color.rgb(30, 145, 115), "Footprint-supported OB", group=G3)
+color contactedColor = input.color(color.rgb(180, 125, 35), "Contacted FP-OB", group=G3)
+color midpointColor = input.color(color.rgb(45, 140, 195), "Midpoint", group=G3)
+color invalidationColor = input.color(color.rgb(195, 70, 85), "Structural failure reference", group=G3)
+color inactiveColor = input.color(color.rgb(125, 130, 140), "Retired history", group=G3)
+
+const string GS = "5 - Original-script TAP compatibility (LIVE)"
+string precisionZoneMethod = input.string("Lower half of candle", "FP-OB zone boundary", options=["Full candle", "Open to low", "Body to low", "Body only", "Lower half of candle"], group=GS)
+int sourceATRLength = input.int(14, "Source TAP ATR length", minval=5, maxval=200, group=GS)
+int sourceVolumeLength = input.int(20, "Source defence volume average", minval=5, maxval=200, group=GS)
+string sourceEntryMode = input.string("Proximal", "Source reference depth", options=["Proximal", "50%", "62%", "70.5%", "79%", "Distal + 1 tick"], group=GS)
+string sourceFrontRunMode = input.string("Auto", "Source front-run buffer", options=["Auto", "ATR", "Ticks", "Off"], group=GS,
+     tooltip="Same calculation as the attached source. This reference can be above the OB. TAP is a reference-based price condition, NOT necessarily actual OB overlap or an executed fill.")
+float sourceFrontRunATR = input.float(0.18, "Source ATR buffer", minval=0.0, maxval=0.5, step=0.01, group=GS)
+int sourceFrontRunTicks = input.int(2, "Source minimum tick buffer", minval=0, maxval=100, group=GS)
+float sourceMaxZoneBuffer = input.float(0.40, "Source Auto cap / zone width", minval=0.01, maxval=1.0, step=0.01, group=GS)
+int sourceEntryOffsetTicks = input.int(0, "Source additional reference offset (ticks)", minval=-100, maxval=100, group=GS)
+float sourceStopATR = input.float(0.15, "Source stop reference below selected distal / birth ATR", minval=0.0, step=0.05, group=GS,
+     tooltip="Post-creation source stop = selected zone bottom minus source ATR at creation times this input. Source invalidity uses LIVE close < this fixed reference, after processing TAP/defence.")
+float sourceApproachATR = input.float(0.25, "Source approach distance / current ATR", minval=0.0, step=0.05, group=GS)
+int sourceMinAge = input.int(3, "Source minimum bars before TAP", minval=1, group=GS)
+int sourceMaxTouches = input.int(4, "Source maximum touches (retires only when count > value)", minval=1, maxval=10, group=GS)
+bool sourceRaiseAfterFirstTap = input.bool(true, "Source first-TAP reference adjustment", group=GS,
+     tooltip="Faithful to the source: adjustment happens immediately on TAP 1, before any defence confirmation. It changes the reference line, not the OB boundaries. This is not proof that the first low was defended.")
+float sourceRepeatTapATR = input.float(0.05, "Source repeat-reference buffer / current ATR", minval=0.0, maxval=0.30, step=0.01, group=GS)
+float sourceRequireDeparture = input.float(1.0, "Source high-based departure / current ATR", minval=0.1, step=0.1, group=GS,
+     tooltip="Uses HIGH, as in the source. Departure can arm on the same bar as a TAP and is never reset after a TAP. No intervening departure is required for the next qualifying candle.")
+int sourceConfirmBars = input.int(3, "Source defence window after latest qualifying TAP", minval=0, maxval=10, group=GS)
+float sourceConfirmRVOL = input.float(1.3, "Source defence minimum RVOL (current-inclusive average)", minval=0.5, step=0.1, group=GS)
+float sourceConfirmCLV = input.float(0.65, "Source defence minimum close location", minval=0.5, maxval=1.0, step=0.05, group=GS)
+int sourceConfirmBOSLength = input.int(3, "Source rolling micro-BOS lookback", minval=1, maxval=10, group=GS)
+bool sourceRequireSweep = input.bool(false, "Require source lower-low ('sweep') condition", group=GS,
+     tooltip="Exactly the source: low < preceding rolling low. No close reclaim is required here. This is separate from the independently tracked iSSL/eSSL sweep/reclaim states.")
+int sourceSweepLength = input.int(5, "Source lower-low lookback", minval=2, maxval=20, group=GS)
+bool sourceShowLabels = input.bool(true, "Source TAP n / Next and defence labels", group=GS)
+bool sourceShowTapCircle = input.bool(true, "Source TAP circle below the candle", group=GS)
+int sourceMarkerLimit = input.int(200, "Retained source annotation labels", minval=30, maxval=250, group=GS)
+color sourceTapColor = input.color(color.rgb(255, 152, 0), "Source TAP", group=GS)
+color sourceDefenceColor = input.color(color.rgb(0, 180, 105), "Source defence", group=GS)
+
+type SourceMarker
+    int zoneId = na
+    label drawing = na
+
+type FootprintSetup
+    int id = na
+    bool active = true
+    bool used = false
+    string reason = "Pending; not plotted"
+    int startBar = na
+    int knownBar = na
+    int knownAt = na
+    float top = na
+    float bottom = na
+    float atr = na
+    float invalidation = na
+    string rule = ""
+    float evidenceRVOL = na
+    int observations = 0
+    float structure = na
+    int structureOrigin = na
+    int structureKnownBar = na
+    int structureKnownAt = na
+    int breakBar = na
+    int breakAt = na
+    int departureBar = na
+    int departureAt = na
+    int displacementBar = na
+    int displacementAt = na
+    int originBar = na
+    int originAt = na
+    float rawOriginHigh = na
+    float rawOriginLow = na
+    float obTop = na
+    float obBottom = na
+    float obInvalidation = na
+    float departureATR = na
+
+type FootprintOB
+    int sourceState = 0
+    int sourceTaps = 0
+    int sourceTapBar = -1
+    bool sourceDeparted = false
+    float sourceReference = na
+    float sourceInitialReference = na
+    float sourceBirthATR = na
+    float formationInvalidation = na
+    int sourceAdjustmentBar = na
+    int sourceAdjustmentAt = na
+    string precisionMethod = ""
+    float rawOriginHigh = na
+    float rawOriginLow = na
+    line sourceReferenceLine = na
+    int id = na
+    int footprintId = na
+    bool active = true
+    string terminalReason = ""
+    int bornBar = na
+    int knownAt = na
+    int endedBar = na
+    int originBar = na
+    int originAt = na
+    int footprintAt = na
+    int departureAt = na
+    int displacementAt = na
+    int structureKnownAt = na
+    int breakAt = na
+    float structure = na
+    float top = na
+    float bottom = na
+    float midpoint = na
+    float invalidation = na
+    float departureATR = na
+    float evidenceRVOL = na
+    int observations = 0
+    string evidenceRule = ""
+    string sslNote = ""
+    int contacts = 0
+    int preContacts = 0
+    bool armed = false
+    box area = na
+    line proximal = na
+    line distal = na
+    line middle = na
+    line failure = na
+    label priceLabel = na
+
+f_px(float price) =>
+    na(price) ? "--" : str.tostring(price, format.mintick)
+
+f_floorTick(float price) =>
+    math.round_to_mintick(math.floor(price / syminfo.mintick) * syminfo.mintick)
+
+f_stamp(int value) =>
+    na(value) ? "--" : str.format_time(value, "yyyy-MM-dd HH:mm", syminfo.timezone)
+
+f_shape(int offset, float atr, float support, float meanVolume, float minRVOL) =>
+    float span = high[offset] - low[offset]
+    bool volumeOK = not na(volume[offset]) and volume[offset] > 0 and not na(meanVolume) and meanVolume > 0
+    bool result = (volumeOK and not na(atr) and atr > 0 and span > 0 and not na(close[offset + 1])
+         and volume[offset] / meanVolume >= minRVOL
+         and math.abs(close[offset] - open[offset]) <= atr * maxEvidenceBody
+         and span <= atr * maxEvidenceRange
+         and (close[offset] - low[offset]) / span >= evidenceCloseLocation
+         and (math.min(open[offset], close[offset]) - low[offset]) / span >= minimumLowerWick
+         and math.max(close[offset + 1] - close[offset], 0.0) <= atr * maxDownsideProgress
+         and not na(support) and low[offset] <= support + atr * supportDistanceATR and close[offset] >= support)
+    result
+
+// All history-dependent TA calculations are executed globally on every bar.
+float atrSeries = ta.atr(atrLength)
+float priorATR = atrSeries[1]
+float volumeMean = ta.sma(volume, volumeLength)
+float validVolumeBars = math.sum(not na(volume) and volume >= 0 ? 1.0 : 0.0, volumeLength)
+float baseValidVolumeBars = math.sum(not na(volume) and volume >= 0 ? 1.0 : 0.0, evidenceWindow)
+float supportSeries = ta.lowest(low, supportLength)
+float priorVolumeMean = volumeMean[1]
+bool priorVolumeReady = not na(validVolumeBars[1]) and validVolumeBars[1] >= volumeLength and not na(priorVolumeMean) and priorVolumeMean > 0
+// Source metrics deliberately use CURRENT-inclusive ATR and volume average.
+// Equivalent highest/lowest expressions are evaluated globally each bar.
+float sourceATR = ta.atr(sourceATRLength)
+float sourceVolMA = ta.sma(volume, sourceVolumeLength)
+float sourceRVOL = sourceVolMA > 0 ? volume / sourceVolMA : 0.0
+float sourceRange = math.max(high - low, syminfo.mintick)
+float sourceCLV = (close - low) / sourceRange
+float sourcePriorLow = ta.lowest(low[1], sourceSweepLength)
+float sourceMicroHigh = ta.highest(high[1], sourceConfirmBOSLength)
+bool sourceInitializationReady = not na(sourceATR) and not na(sourceVolMA) and sourceVolMA > 0
+float candleRange = high - low
+float bodyFraction = candleRange > 0 ? math.abs(close - open) / candleRange : 0.0
+float closeLocation = candleRange > 0 ? (close - low) / candleRange : 0.0
+bool strongDisplacement = (not na(priorATR) and priorATR > 0 and close > open
+     and candleRange >= minimumDisplacementRange * priorATR and bodyFraction >= minimumDisplacementBody
+     and closeLocation >= displacementCloseLocation)
+
+
+// Same-chart nested SSL references. These are PRICE proxies, not stop orders.
+const string G8 = "6 - Secondary internal / external SSL context"
+bool sslEnabled = input.bool(true, "Show internal / external sell-side liquidity references", group=G8)
+int sslInternalDepth = input.int(3, "Internal pivot: left/right bars", minval=1, maxval=20, group=G8)
+int sslExternalDepth = input.int(10, "External pivot: left/right bars", minval=3, maxval=100, group=G8,
+     tooltip="Must exceed internal depth. External range uses the latest confirmed major high/low on THIS chart, not an automatic Weekly request. Recognition necessarily occurs after the right-side bars.")
+bool sslShowEqual = input.bool(true, "Group nearby unconsumed lows as EQL", group=G8)
+float sslEqualATR = input.float(0.05, "EQL tolerance / first member ATR", minval=0.0, maxval=0.3, step=0.01, group=G8,
+     tooltip="Frozen at the first member, with a one-tick minimum. New members cannot chain the band wider than this tolerance. Consumed old levels are NOT used to manufacture a fresh EQL band.")
+int sslPenetrationTicks = input.int(1, "Minimum penetration below lowest boundary (ticks)", minval=1, maxval=20, group=G8)
+int sslReclaimTicks = input.int(1, "Close-back-above highest boundary (ticks)", minval=1, maxval=20, group=G8)
+int sslMaxAge = input.int(250, "SSL reference maximum age (chart bars)", minval=20, maxval=1000, group=G8)
+int sslRecordCap = input.int(30, "Maximum retained SSL records", minval=4, maxval=60, group=G8)
+bool sslKeepTaken = input.bool(true, "Show recent completed sweep / break tags", group=G8)
+int sslHistoryBars = input.int(60, "Keep completed SSL drawings for bars", minval=1, maxval=500, group=G8)
+bool sslShowPrices = input.bool(true, "Small SSL price and event labels", group=G8)
+bool sslShowScaleTracks = input.bool(true, "SSL: show current iSSL/eSSL across chart + price scale", group=G8,
+     tooltip="Independent of the FP-OB price tracks. Draws only the nearest retained live internal/external SSL references; does not invent liquidity when no reference qualifies.")
+bool sslEmphasizeNearest = input.bool(true, "SSL: emphasize nearest live price labels", group=G8,
+     tooltip="Larger high-contrast tags and stronger lines. Enable Small SSL price and event labels to display the tags.")
+int sslContextBars = input.int(10, "Nearby PRIOR reclaim context window for OBs", minval=1, maxval=50, group=G8,
+     tooltip="Context only: never gates OB detection. Same-bar events are not advertised as prior confirmations. A later sweep cannot be added retrospectively to the OB's creation evidence.")
+float sslContextDistance = input.float(1.0, "Maximum interval distance from OB / creation ATR", minval=0.0, maxval=5.0, step=0.1, group=G8)
+color sslInternalColor = input.color(color.new(color.rgb(45, 150, 175), 35), "Internal SSL", group=G8)
+color sslExternalColor = input.color(color.new(color.rgb(210, 105, 55), 35), "External SSL", group=G8)
+color sslSweepColor = input.color(color.rgb(45, 160, 100), "Completed reclaim tag", group=G8)
+color sslBreakColor = input.color(color.rgb(200, 75, 90), "Completed break / gap tag", group=G8)
+
+const int L_UNBREACHED = 0
+const int L_TOUCHED = 1
+const int L_PARTIAL = 2
+const int L_SWEEP = 3
+const int L_GAP_RECLAIM = 4
+const int L_CLOSED_BELOW = 5
+const int L_GAP_THROUGH = 6
+const int L_NO_RECLAIM = 7
+const int L_OLD_RANGE = 8
+const int L_CLUSTERED = 9
+const int L_EXPIRED = 10
+const int L_PRUNED = 11
+const int L_RECOVERY = 12
+
+type SSLPool
+    int id = na
+    int scope = 0
+    int state = 0
+    bool active = true
+    int firstOrigin = na
+    int lastOrigin = na
+    int bornBar = na
+    int knownAt = na
+    int endedBar = na
+    int members = 1
+    int rangeKey = na
+    float lower = na
+    float upper = na
+    float anchor = na
+    float tolerance = na
+    line levelLine = na
+    box area = na
+    label priceLabel = na
+
+type SSLEvent
+    int poolId = na
+    int scope = 0
+    int state = 0
+    int atBar = na
+    int atTime = na
+    float lower = na
+    float upper = na
+
+
+// Fresh confirmed-low view is independent of externalRangeReady and FP/TAP.
+const string GF = "7 - FRESH SSL and developing-low preview"
+bool freshShowConfirmed = input.bool(true, "Show FRESH confirmed SSL level", group=GF,
+     tooltip="A confirmed low that has not been penetrated by at least one tick since recognition. Independent of external-range readiness. This is a price reference, not observed stop orders.")
+bool freshShowDeveloping = input.bool(true, "Show DEV SSL - UNCONFIRMED preview", group=GF,
+     tooltip="Separate developing low that has left-side evidence but is still waiting for right-side confirmation. It can move or disappear. It is never labelled FRESH or added to the confirmed registry by the preview logic.")
+string freshLowSource = input.string("Both", "Confirmed low scale", options=["Internal", "External", "Both"], group=GF,
+     tooltip="Uses the existing internal/external pivot depths on this chart. Both selects the most recent unswept confirmed origin; major recognition of the same origin does not invent a new low. The developing preview uses the faster internal depth when Both is selected.")
+int freshRecordCap = input.int(40, "Retained confirmed-low references", minval=5, maxval=200, group=GF)
+color freshLevelColor = input.color(color.rgb(0, 150, 225), "FRESH SSL highlight", group=GF)
+color developingLevelColor = input.color(color.rgb(145, 150, 160), "Unconfirmed preview", group=GF)
+
+// No drawing handles per historical reference: only the CURRENT selected level
+// is projected. Classification and actual confirmation timestamps stay explicit.
+type FreshSSLReference
+    int originBar = na
+    int originAt = na
+    int knownBar = na
+    int knownAt = na
+    float price = na
+    bool majorSeen = false
+    int majorKnownAt = na
+    bool active = true
+    int breachedBar = na
+
+// Normal var storage, NOT varip: open-bar updates roll back like the source.
+var array<SourceMarker> sourceMarkers = array.new<SourceMarker>()
+
+f_precisionBounds(float o, float h, float l, float c) =>
+    float top = switch precisionZoneMethod
+        "Open to low" => o
+        "Body to low" => math.max(o, c)
+        "Body only" => math.max(o, c)
+        "Lower half of candle" => l + (h - l) * 0.50
+        => h
+    float bottom = precisionZoneMethod == "Body only" ? math.min(o, c) : l
+    [top, bottom]
+
+f_sourceDepth(string mode) =>
+    switch mode
+        "Proximal" => 0.0
+        "50%" => 0.50
+        "62%" => 0.62
+        "70.5%" => 0.705
+        "79%" => 0.79
+        "Distal + 1 tick" => 1.0
+
+f_sourceBuffer(float width, float atr) =>
+    float tickBuffer = sourceFrontRunTicks * syminfo.mintick
+    float atrBuffer = sourceFrontRunATR * atr
+    switch sourceFrontRunMode
+        "ATR" => atrBuffer
+        "Ticks" => tickBuffer
+        "Off" => 0.0
+        => math.min(math.max(tickBuffer, atrBuffer), width * sourceMaxZoneBuffer)
+
+f_sourceInitialReference(float top, float bottom, float atr) =>
+    float width = top - bottom
+    float base = top - width * f_sourceDepth(sourceEntryMode)
+    float value = base + f_sourceBuffer(width, atr) + sourceEntryOffsetTicks * syminfo.mintick
+    sourceEntryMode == "Distal + 1 tick" ? bottom + syminfo.mintick : value
+
+f_sourceState(int state) =>
+    switch state
+        0 => "Source ready (not a claim of untouched history)"
+        1 => "Source tapped / pending"
+        2 => "Source defence condition observed"
+        => "Source invalid / touch limit exceeded"
+
+f_sourceColor(FootprintOB z) =>
+    z.sourceState == 1 ? sourceTapColor : z.sourceState == 2 ? sourceDefenceColor : z.sourceState < 0 ? inactiveColor : zoneColor
+
+f_sourceTip(FootprintOB z) =>
+    "SOURCE-COMPATIBLE TAP; MAY BE OUTSIDE OB; NOT A VERIFIED FILL\nReference comparison: low <= reference AND high >= selected bottom\nCurrent unrounded reference: " + str.tostring(z.sourceReference, "#.########") + "\nInitial reference: " + str.tostring(z.sourceInitialReference, "#.########") + "\nFixed source stop: " + str.tostring(z.invalidation, "#.########") + "\nTAP count (qualifying bars): " + str.tostring(z.sourceTaps) + "\nState: " + f_sourceState(z.sourceState) + "\nDeparture is a high-based latch. Consecutive qualifying bars each count.\nFirst-TAP adjustment precedes defence, as in the source. Live updates are provisional until close.\nInstitutional identity, order quantity and actual fills are unknown."
+
+f_saveSourceMarker(int zoneId, label id) =>
+    SourceMarker m = SourceMarker.new()
+    m.zoneId := zoneId
+    m.drawing := id
+    array.push(sourceMarkers, m)
+    while array.size(sourceMarkers) > sourceMarkerLimit
+        SourceMarker old = array.shift(sourceMarkers)
+        label.delete(old.drawing)
+    true
+
+f_dropSourceMarkers(int zoneId) =>
+    int i = array.size(sourceMarkers) - 1
+    while i >= 0
+        SourceMarker m = array.get(sourceMarkers, i)
+        if m.zoneId == zoneId
+            label.delete(m.drawing)
+            array.remove(sourceMarkers, i)
+        i -= 1
+    true
+
+f_sourceAppearance(FootprintOB z, color c) =>
+    if not na(z.area)
+        box.set_bgcolor(z.area, color.new(c, 82))
+        box.set_border_color(z.area, c)
+    if not na(z.proximal)
+        line.set_color(z.proximal, c)
+    if not na(z.distal)
+        line.set_color(z.distal, c)
+    if not na(z.sourceReferenceLine)
+        line.set_color(z.sourceReferenceLine, c)
+    if not na(z.priceLabel)
+        label.set_color(z.priceLabel, color.new(c, 15))
+    true
+
+f_zoneText(FootprintOB z) =>
+    string state = z.sourceState < 0 ? " OLD" : z.sourceState == 2 ? " DEF" : z.sourceState == 1 ? " PENDING" : " READY"
+    "FP-OB #" + str.tostring(z.id) + " T" + str.tostring(z.sourceTaps) + state + "\nRef " + f_px(z.sourceReference) + " | Stop " + f_px(z.invalidation) + "\nZone " + f_px(z.bottom) + "-" + f_px(z.top)
+
+f_zoneTip(FootprintOB z) =>
+    "FOOTPRINT-QUALIFIED ZONE; SOURCE-COMPATIBLE TAP, NOT VERIFIED ORDERS\n" + syminfo.tickerid + " | " + timeframe.period + "\nEvidence: " + z.evidenceRule + " | RVOL " + str.tostring(z.evidenceRVOL, "#.##") + "x\nFootprint observed: " + f_stamp(z.footprintAt) + "\nOpposing origin: " + f_stamp(z.originAt) + "\nPrecision boundary: " + z.precisionMethod + " | original H/L " + f_px(z.rawOriginHigh) + "/" + f_px(z.rawOriginLow) + "\nFirst departure: " + f_stamp(z.departureAt) + "\nDisplacement: " + f_stamp(z.displacementAt) + "\nFrozen structure: " + f_px(z.structure) + " known " + f_stamp(z.structureKnownAt) + "\nStructure break: " + f_stamp(z.breakAt) + "\nZone first available: " + f_stamp(z.knownAt) + "\nPre-creation integrity reference: " + f_px(z.formationInvalidation) + "\nPre-creation physical contacts: " + str.tostring(z.preContacts) + " (separate from source TAP numbering)\nSSL: " + (z.sslNote == "" ? "None linked" : z.sslNote) + "\n" + f_sourceTip(z)
+
+f_deleteZone(FootprintOB z) =>
+    f_dropSourceMarkers(z.id)
+    if not na(z.sourceReferenceLine)
+        line.delete(z.sourceReferenceLine)
+        z.sourceReferenceLine := na
+    if not na(z.area)
+        box.delete(z.area)
+        z.area := na
+    if not na(z.proximal)
+        line.delete(z.proximal)
+        z.proximal := na
+    if not na(z.distal)
+        line.delete(z.distal)
+        z.distal := na
+    if not na(z.middle)
+        line.delete(z.middle)
+        z.middle := na
+    if not na(z.failure)
+        line.delete(z.failure)
+        z.failure := na
+    if not na(z.priceLabel)
+        label.delete(z.priceLabel)
+        z.priceLabel := na
+    true
+
+f_endLine(line id) =>
+    if not na(id)
+        line.set_x2(id, bar_index)
+        line.set_color(id, color.new(inactiveColor, 55))
+    true
+
+f_retireZone(FootprintOB z, string reason) =>
+    z.sourceState := -1
+    z.active := false
+    z.armed := false
+    z.endedBar := bar_index
+    z.terminalReason := reason
+    if keepInactive
+        if not na(z.area)
+            box.set_right(z.area, bar_index)
+            box.set_bgcolor(z.area, color.new(inactiveColor, 95))
+            box.set_border_color(z.area, color.new(inactiveColor, 60))
+        f_endLine(z.proximal)
+        f_endLine(z.distal)
+        f_endLine(z.middle)
+        f_endLine(z.failure)
+        f_endLine(z.sourceReferenceLine)
+        if not na(z.priceLabel)
+            label.set_x(z.priceLabel, bar_index)
+            label.set_text(z.priceLabel, "OLD FP-OB #" + str.tostring(z.id))
+            label.set_tooltip(z.priceLabel, f_zoneTip(z))
+            label.set_color(z.priceLabel, color.new(inactiveColor, 75))
+    else
+        f_deleteZone(z)
+    true
+
+f_colorContacted(FootprintOB z) =>
+    if not na(z.area)
+        box.set_bgcolor(z.area, color.new(contactedColor, 85))
+        box.set_border_color(z.area, contactedColor)
+    if not na(z.proximal)
+        line.set_color(z.proximal, contactedColor)
+    if not na(z.distal)
+        line.set_color(z.distal, contactedColor)
+    if not na(z.priceLabel)
+        label.set_color(z.priceLabel, color.new(contactedColor, 15))
+    true
+
+f_drawZone(FootprintOB z) =>
+    color c = f_sourceColor(z)
+    int end = bar_index + projectionBars
+    z.sourceReferenceLine := line.new(bar_index, z.sourceReference, end, z.sourceReference, xloc=xloc.bar_index, color=zoneColor, width=2)
+    z.area := box.new(bar_index, z.top, end, z.bottom, xloc=xloc.bar_index,
+         bgcolor=color.new(c, 82), border_color=c, border_width=2)
+    z.proximal := line.new(bar_index, z.top, end, z.top, xloc=xloc.bar_index, color=c, width=2)
+    z.distal := line.new(bar_index, z.bottom, end, z.bottom, xloc=xloc.bar_index, color=c, width=2)
+    if showMidpoint
+        z.middle := line.new(bar_index, z.midpoint, end, z.midpoint, xloc=xloc.bar_index, color=midpointColor, style=line.style_dashed)
+    if showInvalidation
+        z.failure := line.new(bar_index, z.invalidation, end, z.invalidation, xloc=xloc.bar_index, color=invalidationColor, style=line.style_dotted)
+    if showLevelLabels
+        z.priceLabel := label.new(bar_index + labelOffset, z.midpoint, f_zoneText(z), xloc=xloc.bar_index, yloc=yloc.price,
+             color=color.new(c, 15), textcolor=color.white, style=label.style_label_right, size=size.tiny, textalign=text.align_left, tooltip=f_zoneTip(z))
+    true
+
+f_stopSetup(FootprintSetup f, string reason) =>
+    f.active := false
+    f.reason := reason
+    true
+
+f_nearestBearish() =>
+    int offset = na
+    for j = 1 to originSearch
+        if not na(open[j]) and close[j] < open[j]
+            offset := j
+            break
+    offset
+
+// Reconstruct observed history since this fixed origin. The source is NOT
+// replaced if a later candle looks nicer. Contact is not a broker fill.
+f_legState(int originBar, float top, float bottom, float invalidation, float atr) =>
+    int contacts = 0
+    bool armed = false
+    bool broken = false
+    int count = bar_index - originBar
+    if count > 0
+        for step = 1 to count
+            int k = count - step
+            float failurePrice = invalidationMode == "Close" ? close[k] : low[k]
+            if failurePrice < invalidation
+                broken := true
+            bool overlap = low[k] <= top and high[k] >= bottom
+            if armed and overlap
+                contacts += 1
+                armed := false
+            else if close[k] > top + atr * contactDepartureATR and (contacts == 0 or not overlap)
+                armed := true
+    [contacts, armed, broken]
+
+
+// SOURCE-COMPATIBLE TAP STATE MACHINE. The order of operations below is the
+// attachment's order: departure -> approach -> TAP/adjustment -> defence ->
+// timeout -> invalidity. It is intentionally NOT the v8 episode algorithm.
+f_sourceTapStep(FootprintOB z) =>
+    int state = z.sourceState
+    int tapCount = z.sourceTaps
+    int tapBar = z.sourceTapBar
+    bool hasDeparted = z.sourceDeparted
+    int age = bar_index - z.bornBar
+    float top = z.top
+    float bot = z.bottom
+    float entry = z.sourceReference
+    float stop = z.invalidation
+    bool anyApproach = false
+    bool anyTap = false
+    bool anyConfirm = false
+    bool anyDead = false
+
+    if state >= 0 and not hasDeparted and high >= top + sourceATR * sourceRequireDeparture
+        hasDeparted := true
+        z.sourceDeparted := true
+
+    bool approaching = state >= 0 and hasDeparted and age >= sourceMinAge and close > entry and low <= entry + sourceATR * sourceApproachATR
+    if approaching
+        anyApproach := true
+
+    // Exact reference-based source condition: high >= BOT, not high >= ENTRY.
+    // It may qualify above the drawn OB or on a bar below the reference.
+    bool touched = state >= 0 and hasDeparted and age >= sourceMinAge and low <= entry and high >= bot
+    bool swept = low < sourcePriorLow
+    bool qualifiedTap = touched and (not sourceRequireSweep or swept)
+    if qualifiedTap and (tapBar < 0 or bar_index > tapBar)
+        tapCount += 1
+        tapBar := bar_index
+        state := 1
+        z.sourceTaps := tapCount
+        z.sourceTapBar := tapBar
+        z.sourceState := state
+
+        // Faithfully immediate on TAP 1, NOT after defence confirmation.
+        if sourceRaiseAfterFirstTap and tapCount == 1
+            float adaptiveReference = math.max(entry, low + sourceATR * sourceRepeatTapATR)
+            z.sourceReference := adaptiveReference
+            z.sourceAdjustmentBar := bar_index
+            z.sourceAdjustmentAt := time_close
+            if not na(z.sourceReferenceLine)
+                line.set_y1(z.sourceReferenceLine, adaptiveReference)
+                line.set_y2(z.sourceReferenceLine, adaptiveReference)
+            entry := adaptiveReference
+
+        f_sourceAppearance(z, sourceTapColor)
+        anyTap := true
+        if sourceShowLabels
+            label id = label.new(bar_index, low, "TAP " + str.tostring(tapCount) + "\nNext " + str.tostring(entry, format.mintick),
+                 style=label.style_label_up, color=sourceTapColor, textcolor=color.black, size=size.tiny, tooltip=f_sourceTip(z))
+            f_saveSourceMarker(z.id, id)
+
+    bool pending = state == 1 and tapBar >= 0 and bar_index - tapBar <= sourceConfirmBars
+    bool microBOS = close > sourceMicroHigh
+    bool defence = barstate.isconfirmed and pending and close > open and sourceCLV >= sourceConfirmCLV and sourceRVOL >= sourceConfirmRVOL and close > top and microBOS
+    if defence
+        state := 2
+        z.sourceState := state
+        f_sourceAppearance(z, sourceDefenceColor)
+        anyConfirm := true
+        if sourceShowLabels
+            label id = label.new(bar_index, low, "DEFENCE CONFIRMED", style=label.style_label_up,
+                 color=sourceDefenceColor, textcolor=color.white, size=size.small, tooltip=f_sourceTip(z))
+            f_saveSourceMarker(z.id, id)
+
+    // Original source reset: tap count/reference/departure latch are NOT reset.
+    if state == 1 and bar_index - tapBar > sourceConfirmBars
+        state := 0
+        z.sourceState := state
+        f_sourceAppearance(z, zoneColor)
+
+    // Exact source > limit, AFTER TAP/defence. At maxTouches=4, TAP 5 can be
+    // printed before retirement on this same bar. Do not silently change to >=.
+    bool invalid = state >= 0 and (close < stop or tapCount > sourceMaxTouches)
+    if invalid
+        state := -1
+        z.sourceState := state
+        f_retireZone(z, close < stop ? "Source live-close stop condition" : "Source tap count exceeded maximum")
+        anyDead := true
+
+    z.sourceState := state
+    z.active := state >= 0
+    [anyApproach, anyTap, anyConfirm, anyDead]
+
+var array<FreshSSLReference> freshReferences = array.new<FreshSSLReference>()
+var int freshReferencesCreated = 0
+var int freshReferencesBreached = 0
+var int freshLastMinorOrigin = na
+var int freshLastMajorOrigin = na
+var float developingCandidate = na
+var int developingOriginBar = na
+var int developingOriginAt = na
+var line freshCurrentLine = na
+var label freshCurrentLabel = na
+var line developingLine = na
+var label developingLabel = na
+
+f_registerFresh(array<FreshSSLReference> refs, float price, int origin, int originAt, bool major) =>
+    bool added = false
+    bool existing = false
+    if array.size(refs) > 0
+        for i = 0 to array.size(refs) - 1
+            FreshSSLReference r = array.get(refs, i)
+            if r.originBar == origin
+                existing := true
+                if major and not r.majorSeen
+                    r.majorSeen := true
+                    r.majorKnownAt := time_close
+                // Crucial: do NOT set active=true or reset knownBar here.
+                // Later major recognition cannot revive a breached origin.
+    if not existing and not na(price) and price > 0
+        FreshSSLReference r = FreshSSLReference.new()
+        r.originBar := origin
+        r.originAt := originAt
+        r.knownBar := bar_index
+        r.knownAt := time_close
+        r.price := math.round_to_mintick(price)
+        r.majorSeen := major
+        r.majorKnownAt := major ? time_close : na
+        array.push(refs, r)
+        added := true
+    added
+
+// SSL drawings belong to their records. No pooled stale drawing slots.
+f_sslName(SSLPool p) =>
+    (p.scope == 1 ? "eSSL" : "iSSL") + (p.members > 1 ? " EQL" : "")
+
+f_sslState(int state) =>
+    switch state
+        L_UNBREACHED => "Unbreached reference"
+        L_TOUCHED => "Touched"
+        L_PARTIAL => "Partial penetration"
+        L_SWEEP => "Swept / reclaimed"
+        L_GAP_RECLAIM => "Gap reclaim"
+        L_CLOSED_BELOW => "Closed below"
+        L_GAP_THROUGH => "Gapped through"
+        L_NO_RECLAIM => "Breached, not reclaimed"
+        L_OLD_RANGE => "Outside current range"
+        L_CLUSTERED => "Superseded by EQL / major reference"
+        L_EXPIRED => "Expired"
+        L_RECOVERY => "Recovered from below, not a new sweep"
+        => "No longer tracked"
+
+f_sslText(SSLPool p) =>
+    string prices = p.upper - p.lower >= syminfo.mintick * 0.5 ? f_px(p.lower) + "-" + f_px(p.upper) : f_px(p.lower)
+    string stateTag = p.state == L_TOUCHED ? " test" : p.state == L_PARTIAL ? " partial" : ""
+    f_sslName(p) + " " + prices + stateTag
+
+f_sslTip(SSLPool p) =>
+    "PRICE-BASED SELL-SIDE LIQUIDITY REFERENCE; NOT OBSERVED STOP ORDERS\n" + f_sslName(p) + " #" + str.tostring(p.id) + "\nKnown at close: " + str.format_time(p.knownAt, "yyyy-MM-dd HH:mm", syminfo.timezone) + "\nBounds: " + f_px(p.lower) + " to " + f_px(p.upper) + "\nConfirmed low observations: " + str.tostring(p.members) + "\nState: " + f_sslState(p.state) + "\nA sweep needs penetration below the LOWEST boundary and a close above the HIGHEST boundary. Owner, quantity and actual stop fills are unknown."
+
+f_deleteSSL(SSLPool p) =>
+    if not na(p.levelLine)
+        line.delete(p.levelLine)
+        p.levelLine := na
+    if not na(p.area)
+        box.delete(p.area)
+        p.area := na
+    if not na(p.priceLabel)
+        label.delete(p.priceLabel)
+        p.priceLabel := na
+    true
+
+f_drawSSL(SSLPool p) =>
+    color base = p.scope == 1 ? sslExternalColor : sslInternalColor
+    p.levelLine := line.new(p.bornBar, p.lower, p.bornBar + projectionBars, p.lower,
+         xloc=xloc.bar_index, color=base, width=p.scope == 1 ? 2 : 1, style=p.scope == 1 ? line.style_solid : line.style_dashed)
+    if p.upper - p.lower >= syminfo.mintick * 0.5
+        p.area := box.new(left=p.bornBar, top=p.upper, right=p.bornBar + projectionBars, bottom=p.lower,
+             xloc=xloc.bar_index, bgcolor=color.new(base, 91), border_color=color.new(base, 35), border_style=line.style_dotted)
+    if sslShowPrices
+        p.priceLabel := label.new(bar_index + labelOffset, p.lower, f_sslText(p), xloc=xloc.bar_index, yloc=yloc.price,
+             color=color.new(base, 100), textcolor=base, style=label.style_label_right, size=size.tiny, textalign=text.align_left, tooltip=f_sslTip(p))
+    true
+
+f_finishSSL(SSLPool p, int state) =>
+    p.active := false
+    p.state := state
+    p.endedBar := bar_index
+    bool priceEvent = (state >= L_SWEEP and state <= L_NO_RECLAIM) or state == L_RECOVERY
+    if sslKeepTaken and priceEvent
+        color eventColor = state == L_SWEEP or state == L_GAP_RECLAIM or state == L_RECOVERY ? sslSweepColor : sslBreakColor
+        if not na(p.levelLine)
+            line.set_x2(p.levelLine, bar_index)
+            line.set_color(p.levelLine, color.new(eventColor, 55))
+        if not na(p.area)
+            box.set_right(p.area, bar_index)
+            box.set_bgcolor(p.area, color.new(eventColor, 95))
+            box.set_border_color(p.area, color.new(eventColor, 65))
+        string tag = state == L_RECOVERY ? " recovery" : state == L_SWEEP ? " sweep" : state == L_GAP_RECLAIM ? " gap reclaim" : state == L_CLOSED_BELOW ? " broken" : state == L_GAP_THROUGH ? " gap through" : " breach"
+        if sslShowPrices and not na(p.priceLabel)
+            label.set_xy(p.priceLabel, bar_index, p.lower)
+            label.set_text(p.priceLabel, f_sslName(p) + tag)
+            label.set_textcolor(p.priceLabel, eventColor)
+            label.set_tooltip(p.priceLabel, f_sslTip(p))
+    else
+        // Administrative retirement is NOT a claimed sweep or fill.
+        f_deleteSSL(p)
+    true
+
+f_registerSSL(array<SSLPool> pools, int scope, float price, int sourceBar, int newId, int rangeKey, float creationATR) =>
+    bool created = false
+    bool duplicate = false
+    int matchIndex = -1
+    float bestDistance = na
+    if array.size(pools) > 0
+        for i = 0 to array.size(pools) - 1
+            SSLPool old = array.get(pools, i)
+            if old.scope == scope and (old.firstOrigin == sourceBar or old.lastOrigin == sourceBar)
+                duplicate := true
+            // A CONSUMED old pool cannot qualify a new "untaken" EQL pool.
+            if sslShowEqual and old.active and old.scope == scope
+                float newWidth = math.max(old.upper, price) - math.min(old.lower, price)
+                float anchorDistance = math.abs(price - old.anchor)
+                if anchorDistance <= old.tolerance + syminfo.mintick * 0.000001 and newWidth <= old.tolerance + syminfo.mintick * 0.000001
+                    if matchIndex == -1 or anchorDistance < bestDistance
+                        matchIndex := i
+                        bestDistance := anchorDistance
+    if not duplicate and not na(price) and price > 0
+        SSLPool p = SSLPool.new()
+        p.id := newId
+        p.scope := scope
+        p.firstOrigin := sourceBar
+        p.lastOrigin := sourceBar
+        p.bornBar := bar_index
+        p.knownAt := time_close
+        p.rangeKey := rangeKey
+        p.lower := price
+        p.upper := price
+        p.anchor := price
+        p.tolerance := math.max(syminfo.mintick, creationATR * sslEqualATR)
+        if matchIndex >= 0
+            SSLPool old = array.get(pools, matchIndex)
+            p.firstOrigin := old.firstOrigin
+            p.lower := math.min(old.lower, price)
+            p.upper := math.max(old.upper, price)
+            p.anchor := old.anchor
+            p.tolerance := old.tolerance
+            p.members := old.members + 1
+            p.state := old.state
+            // New composite band starts NOW. Do not stretch the old historical
+            // boundary downward/upward or restore its touched/partial state.
+            f_finishSSL(old, L_CLUSTERED)
+        f_drawSSL(p)
+        array.push(pools, p)
+        created := true
+    created
+
+f_sslContext(array<SSLEvent> events, float top, float bottom, float creationATR, int atBar) =>
+    string note = ""
+    if array.size(events) > 0
+        for step = 0 to array.size(events) - 1
+            SSLEvent e = array.get(events, array.size(events) - 1 - step)
+            int age = atBar - e.atBar
+            float distance = math.max(0.0, math.max(bottom - e.upper, e.lower - top))
+            if age > 0 and age <= sslContextBars and distance <= creationATR * sslContextDistance
+                note := (e.scope == 1 ? "eSSL" : "iSSL") + (e.state == L_GAP_RECLAIM ? " gap reclaim" : " reclaim") + " nearby, " + str.tostring(age) + " bars earlier (context only)"
+                break
+    note
+
+
+float sslMinorLowPivot = ta.pivotlow(low, sslInternalDepth, sslInternalDepth)
+float sslMajorLowPivot = ta.pivotlow(low, sslExternalDepth, sslExternalDepth)
+float sslMajorHighPivot = ta.pivothigh(high, sslExternalDepth, sslExternalDepth)
+float minorHighPivot = ta.pivothigh(high, sslInternalDepth, sslInternalDepth)
+float selectedHighPivot = confirmationStructure == "Internal" ? minorHighPivot : sslMajorHighPivot
+int selectedHighDepth = confirmationStructure == "Internal" ? sslInternalDepth : sslExternalDepth
+
+var array<FootprintSetup> setups = array.new<FootprintSetup>()
+var array<FootprintOB> zones = array.new<FootprintOB>()
+var int nextSetupId = 1
+var int nextZoneId = 1
+var int footprintsObserved = 0
+var int footprintOBsCreated = 0
+var int evidenceDuplicates = 0
+var string lastDecision = "Waiting for footprint evidence; no generic OB fallback"
+var float knownStructureHigh = na
+var int knownStructureOrigin = na
+var int knownStructureBar = na
+var int knownStructureAt = na
+var bool structureConsumed = false
+
+var array<SSLPool> sslPools = array.new<SSLPool>()
+var array<SSLEvent> sslEvents = array.new<SSLEvent>()
+var int sslNextID = 1
+var int sslCreated = 0
+var int sslReclaims = 0
+var int sslBreaks = 0
+var int sslRecoveries = 0
+var float sslMajorLow = na
+var float sslMajorHigh = na
+var int sslMajorLowOrigin = na
+var int sslMajorHighOrigin = na
+var int sslLastMajorLowObserved = na
+var int sslLastMajorHighObserved = na
+var int sslLastMinorObserved = na
+var int sslLastExternalIssued = na
+var int sslRangeKey = 0
+var bool sslRangeBroken = false
+
+if barstate.isfirst
+    if not chart.is_standard or timeframe.isticks
+        runtime.error("Use standard time-based OHLC candles, not synthetic or tick charts.")
+    if sslExternalDepth <= sslInternalDepth
+        runtime.error("External pivot depth must exceed internal pivot depth.")
+    if minimumEvidenceBars > evidenceWindow
+        runtime.error("Minimum repeated observations cannot exceed the evidence window.")
+    if syminfo.mintick <= 0
+        runtime.error("A positive symbol tick size is required.")
+
+// Lifecycle first: failed evidence cannot be rescued by a later condition in
+// the same pass. Nothing in the pending-setup collection is drawn.
+if barstate.isconfirmed
+    if array.size(setups) > 0
+        for i = 0 to array.size(setups) - 1
+            FootprintSetup f = array.get(setups, i)
+            if f.active and bar_index > f.knownBar
+                float failurePrice = invalidationMode == "Close" ? close : low
+                if failurePrice < f.invalidation
+                    f_stopSetup(f, "Footprint area failed")
+                else if bar_index - f.knownBar > confirmationDeadline
+                    f_stopSetup(f, "Confirmation deadline expired")
+                else if not na(f.obInvalidation) and failurePrice < f.obInvalidation
+                    f_stopSetup(f, "Frozen origin failed while pending")
+                else if not na(f.departureBar) and na(f.displacementBar) and bar_index - f.departureBar > displacementGrace
+                    f_stopSetup(f, "Departure lacked strong displacement")
+                else if not na(f.breakBar) and (bar_index - f.breakBar > breakGrace or close <= f.structure)
+                    f_stopSetup(f, "Buffered break response expired or failed")
+
+
+// ============================================================================
+// SSL lifecycle is evaluated BEFORE any new pivot/range is published.
+// A newly recognised reference cannot be swept on its own creation bar.
+// ============================================================================
+if barstate.isconfirmed and sslEnabled
+    float sslEpsilon = syminfo.mintick * 0.000001
+    if array.size(sslPools) > 0
+        for i = 0 to array.size(sslPools) - 1
+            SSLPool p = array.get(sslPools, i)
+            if p.active and bar_index > p.bornBar
+                bool fullPenetration = low <= p.lower - sslPenetrationTicks * syminfo.mintick + sslEpsilon
+                bool priceOverlap = low <= p.upper + sslEpsilon and high >= p.lower - sslEpsilon
+                if fullPenetration
+                    bool reclaimed = close >= p.upper + sslReclaimTicks * syminfo.mintick - sslEpsilon
+                    bool wholeBarBelow = high < p.lower - sslEpsilon
+                    bool openedBelow = open < p.lower - sslEpsilon
+                    bool fromAbove = not na(close[1]) and close[1] >= p.lower - sslEpsilon
+                    bool gapFromAbove = openedBelow and fromAbove
+                    int finalState = L_NO_RECLAIM
+                    if wholeBarBelow
+                        finalState := gapFromAbove ? L_GAP_THROUGH : L_CLOSED_BELOW
+                    else if reclaimed
+                        finalState := gapFromAbove ? L_GAP_RECLAIM : fromAbove and not openedBelow ? L_SWEEP : L_RECOVERY
+                    else if close < p.lower - sslEpsilon
+                        finalState := L_CLOSED_BELOW
+                    if finalState == L_SWEEP or finalState == L_GAP_RECLAIM
+                        SSLEvent event = SSLEvent.new()
+                        event.poolId := p.id
+                        event.scope := p.scope
+                        event.state := finalState
+                        event.atBar := bar_index
+                        event.atTime := time_close
+                        event.lower := p.lower
+                        event.upper := p.upper
+                        array.push(sslEvents, event)
+                        sslReclaims += 1
+                    else if finalState == L_RECOVERY
+                        sslRecoveries += 1
+                    else
+                        sslBreaks += 1
+                    // First full penetration is terminal under this definition.
+                    // A later recovery never restores this record to unbreached.
+                    f_finishSSL(p, finalState)
+                else if bar_index - p.bornBar >= sslMaxAge
+                    f_finishSSL(p, L_EXPIRED)
+                else if priceOverlap
+                    if low < p.upper - sslEpsilon
+                        p.state := L_PARTIAL
+                    else if p.state == L_UNBREACHED
+                        p.state := L_TOUCHED
+            else if not p.active and not na(p.endedBar) and bar_index - p.endedBar > sslHistoryBars
+                f_deleteSSL(p)
+
+    // Close failure invalidates the old external range even if a new major low
+    // needs more bars to confirm. A later close recovery alone does not reset it.
+    if not na(sslMajorLow) and close < sslMajorLow - sslEpsilon
+        sslRangeBroken := true
+
+    bool newMajorLow = not na(sslMajorLowPivot) and (na(sslLastMajorLowObserved) or bar_index - sslExternalDepth != sslLastMajorLowObserved)
+    bool newMajorHigh = not na(sslMajorHighPivot) and (na(sslLastMajorHighObserved) or bar_index - sslExternalDepth != sslLastMajorHighObserved)
+    if newMajorLow
+        sslMajorLow := math.round_to_mintick(sslMajorLowPivot)
+        sslMajorLowOrigin := bar_index - sslExternalDepth
+        sslLastMajorLowObserved := sslMajorLowOrigin
+        sslRangeBroken := false
+        sslRangeKey += 1
+    if newMajorHigh
+        sslMajorHigh := math.round_to_mintick(sslMajorHighPivot)
+        sslMajorHighOrigin := bar_index - sslExternalDepth
+        sslLastMajorHighObserved := sslMajorHighOrigin
+        sslRangeKey += 1
+
+    bool externalRangeReady = (not sslRangeBroken and not na(sslMajorLow) and not na(sslMajorHigh)
+         and sslMajorHigh > sslMajorLow + sslEpsilon)
+    // Internal means INSIDE this currently known external range, not merely
+    // "detected with the smaller pivot length". Reclassification is current,
+    // never backdated. Old-range removal is not labelled a liquidity sweep.
+    if array.size(sslPools) > 0
+        for i = 0 to array.size(sslPools) - 1
+            SSLPool p = array.get(sslPools, i)
+            if p.active and p.scope == 0
+                bool stillInternal = externalRangeReady and p.lower > sslMajorLow + sslEpsilon and p.upper < sslMajorHigh - sslEpsilon
+                if not stillInternal
+                    f_finishSSL(p, L_OLD_RANGE)
+                else
+                    p.rangeKey := sslRangeKey
+
+    // The same physical low may first be internal and only later become a
+    // confirmed major boundary. The old internal drawing ends; a NEW eSSL
+    // reference starts at its later recognition. No early external label.
+    if externalRangeReady and not na(priorATR) and priorATR > 0 and (na(sslLastExternalIssued) or sslMajorLowOrigin != sslLastExternalIssued)
+        bool madeExternal = f_registerSSL(sslPools, 1, sslMajorLow, sslMajorLowOrigin, sslNextID, sslRangeKey, priorATR)
+        if madeExternal
+            sslNextID += 1
+            sslCreated += 1
+        sslLastExternalIssued := sslMajorLowOrigin
+
+    bool newMinorLow = not na(sslMinorLowPivot) and (na(sslLastMinorObserved) or bar_index - sslInternalDepth != sslLastMinorObserved)
+    if newMinorLow
+        int sourceBar = bar_index - sslInternalDepth
+        float minorPrice = math.round_to_mintick(sslMinorLowPivot)
+        bool insideRange = externalRangeReady and minorPrice > sslMajorLow + sslEpsilon and minorPrice < sslMajorHigh - sslEpsilon
+        if insideRange and not na(priorATR) and priorATR > 0
+            bool madeInternal = f_registerSSL(sslPools, 0, minorPrice, sourceBar, sslNextID, sslRangeKey, priorATR)
+            if madeInternal
+                sslNextID += 1
+                sslCreated += 1
+        sslLastMinorObserved := sourceBar
+
+    // Explicit bounded ownership, not forward-removal from the traversed list.
+    while array.size(sslPools) > sslRecordCap
+        int removeIndex = 0
+        bool foundInactive = false
+        for i = 0 to array.size(sslPools) - 1
+            SSLPool p = array.get(sslPools, i)
+            if not p.active and not foundInactive
+                removeIndex := i
+                foundInactive := true
+        SSLPool removed = array.remove(sslPools, removeIndex)
+        if removed.active
+            f_finishSSL(removed, L_PRUNED)
+        f_deleteSSL(removed)
+    while array.size(sslEvents) > 60
+        array.shift(sslEvents)
+
+// Independent SSL view selection. Never depends on a footprint-supported OB.
+// Only retained LIVE records are eligible; no low is invented to fill a chart.
+float sslReferenceClose = barstate.isconfirmed ? close : close[1]
+int sslNearestInternalIndex = -1
+int sslNearestExternalIndex = -1
+float sslInternalDistance = na
+float sslExternalDistance = na
+float sslInternalTrack = na
+float sslExternalTrack = na
+int sslLiveInternalCount = 0
+int sslLiveExternalCount = 0
+if sslEnabled and array.size(sslPools) > 0
+    for i = 0 to array.size(sslPools) - 1
+        SSLPool p = array.get(sslPools, i)
+        if p.active
+            if p.scope == 0
+                sslLiveInternalCount += 1
+            else
+                sslLiveExternalCount += 1
+            if not na(sslReferenceClose)
+                float distance = math.max(0.0, math.max(p.lower - sslReferenceClose, sslReferenceClose - p.upper))
+                if p.scope == 0
+                    if sslNearestInternalIndex == -1 or distance <= sslInternalDistance
+                        sslNearestInternalIndex := i
+                        sslInternalDistance := distance
+                        sslInternalTrack := p.lower
+                else
+                    if sslNearestExternalIndex == -1 or distance <= sslExternalDistance
+                        sslNearestExternalIndex := i
+                        sslExternalDistance := distance
+                        sslExternalTrack := p.lower
+
+// View coordinates may follow the last candle; detection, prices and lifecycle
+// remain unchanged. Nearest tags are readable even without any live FP-OB.
+if barstate.islast and sslEnabled and array.size(sslPools) > 0
+    for i = 0 to array.size(sslPools) - 1
+        SSLPool p = array.get(sslPools, i)
+        if p.active
+            bool nearest = i == sslNearestInternalIndex or i == sslNearestExternalIndex
+            bool emphasize = sslEmphasizeNearest and nearest
+            color base = p.scope == 1 ? sslExternalColor : sslInternalColor
+            color visibleColor = emphasize ? color.new(base, 0) : base
+            int width = p.scope == 1 ? (emphasize ? 3 : 2) : (emphasize ? 2 : 1)
+            if not na(p.levelLine)
+                line.set_x2(p.levelLine, bar_index + projectionBars)
+                line.set_color(p.levelLine, visibleColor)
+                line.set_width(p.levelLine, width)
+            if not na(p.area)
+                box.set_right(p.area, bar_index + projectionBars)
+            if not na(p.priceLabel)
+                label.set_xy(p.priceLabel, bar_index + labelOffset, p.lower)
+                label.set_text(p.priceLabel, f_sslText(p))
+                label.set_tooltip(p.priceLabel, f_sslTip(p))
+                label.set_size(p.priceLabel, emphasize ? size.small : size.tiny)
+                label.set_color(p.priceLabel, emphasize ? color.new(base, 12) : color.new(base, 100))
+                label.set_textcolor(p.priceLabel, emphasize ? color.white : base)
+        else if not na(p.priceLabel)
+            // A former focus tag must not keep its opaque live background
+            // after retirement; preserve the original event text and colour.
+            label.set_color(p.priceLabel, color.new(inactiveColor, 100))
+            label.set_size(p.priceLabel, size.tiny)
+
+// These are CURRENT reference tracks, not backdated liquidity signals. Labels
+// and ordinary lifecycle lines still identify actual knowledge/event dates.
+// No active record -> na value and transparent track colour, not stale fallback.
+color sslInternalTrackColor = na(sslInternalTrack) ? color.new(sslInternalColor, 100) : color.new(sslInternalColor, 0)
+color sslExternalTrackColor = na(sslExternalTrack) ? color.new(sslExternalColor, 100) : color.new(sslExternalColor, 0)
+plot(sslEnabled and sslShowScaleTracks and barstate.islast ? sslInternalTrack : na, "CURRENT live iSSL reference", color=sslInternalTrackColor, linewidth=2, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(sslEnabled and sslShowScaleTracks and barstate.islast ? sslExternalTrack : na, "CURRENT live eSSL reference", color=sslExternalTrackColor, linewidth=2, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(sslLiveInternalCount, "Diagnostic: live iSSL records", display=display.data_window)
+plot(sslLiveExternalCount, "Diagnostic: live eSSL records", display=display.data_window)
+plot(sslInternalTrack, "Diagnostic: selected live iSSL price", display=display.data_window)
+plot(sslExternalTrack, "Diagnostic: selected live eSSL price", display=display.data_window)
+
+// Fresh confirmed-low publication: deliberately NO externalRangeReady,
+// footprint, ATR/volume warm-up, or source-TAP-state prerequisite.
+int freshPreviewDepth = freshLowSource == "External" ? sslExternalDepth : sslInternalDepth
+float freshLeftReference = ta.lowest(low[1], freshPreviewDepth)
+bool freshLeftQualifiedNow = bar_index >= freshPreviewDepth and not na(freshLeftReference) and not na(low) and low > 0 and low <= freshLeftReference
+float freshEpsilon = syminfo.mintick * 0.000001
+bool freshModuleOn = freshShowConfirmed or freshShowDeveloping
+
+if barstate.isconfirmed and freshModuleOn
+    // Old confirmed prices are tested before publishing newly confirmed lows.
+    if array.size(freshReferences) > 0
+        for i = 0 to array.size(freshReferences) - 1
+            FreshSSLReference r = array.get(freshReferences, i)
+            if r.active and bar_index > r.knownBar and low <= r.price - syminfo.mintick + freshEpsilon
+                r.active := false
+                r.breachedBar := bar_index
+                freshReferencesBreached += 1
+
+    if freshLowSource != "External" and not na(sslMinorLowPivot)
+        int origin = bar_index - sslInternalDepth
+        if na(freshLastMinorOrigin) or origin != freshLastMinorOrigin
+            bool added = f_registerFresh(freshReferences, sslMinorLowPivot, origin, time[sslInternalDepth], false)
+            if added
+                freshReferencesCreated += 1
+            freshLastMinorOrigin := origin
+    if freshLowSource != "Internal" and not na(sslMajorLowPivot)
+        int origin = bar_index - sslExternalDepth
+        if na(freshLastMajorOrigin) or origin != freshLastMajorOrigin
+            bool added = f_registerFresh(freshReferences, sslMajorLowPivot, origin, time[sslExternalDepth], true)
+            if added
+                freshReferencesCreated += 1
+            freshLastMajorOrigin := origin
+
+    // The preview is NOT a confirmed reference and never enters the registry.
+    if freshLeftQualifiedNow
+        developingCandidate := math.round_to_mintick(low)
+        developingOriginBar := bar_index
+        developingOriginAt := time
+    if not na(developingOriginBar) and bar_index - developingOriginBar >= freshPreviewDepth
+        developingCandidate := na
+        developingOriginBar := na
+        developingOriginAt := na
+
+    while array.size(freshReferences) > freshRecordCap
+        int removeIndex = -1
+        int oldestOrigin = na
+        bool foundInactive = false
+        for i = 0 to array.size(freshReferences) - 1
+            FreshSSLReference r = array.get(freshReferences, i)
+            if not r.active
+                if not foundInactive or r.originBar < oldestOrigin
+                    removeIndex := i
+                    oldestOrigin := r.originBar
+                    foundInactive := true
+            else if not foundInactive and (removeIndex == -1 or r.originBar < oldestOrigin)
+                removeIndex := i
+                oldestOrigin := r.originBar
+        array.remove(freshReferences, removeIndex)
+
+// Choose the latest confirmed ORIGIN that is still unbreached, not merely the
+// nearest legacy pool (which may already be tested/partial or range-suppressed).
+int freshSelectedIndex = -1
+int freshSelectedOrigin = na
+float freshSelectedPrice = na
+int freshUnbreachedCount = 0
+if freshModuleOn and array.size(freshReferences) > 0
+    for i = 0 to array.size(freshReferences) - 1
+        FreshSSLReference r = array.get(freshReferences, i)
+        // Do not continue calling it fresh after an observed open-bar price
+        // penetration. Final sweep/break classification remains a close event.
+        bool livePenetration = bar_index > r.knownBar and low <= r.price - syminfo.mintick + freshEpsilon
+        bool belowMarket = not na(close) and close >= r.price - freshEpsilon
+        if r.active and not livePenetration and belowMarket
+            freshUnbreachedCount += 1
+            if freshSelectedIndex == -1 or r.originBar > freshSelectedOrigin
+                freshSelectedIndex := i
+                freshSelectedOrigin := r.originBar
+                freshSelectedPrice := r.price
+
+// Live left-side evidence may update the one developing preview. It is never
+// described as fresh/confirmed until the native right-side pivot confirms.
+float developingViewPrice = na
+int developingViewOrigin = na
+int developingViewTime = na
+if freshModuleOn and freshShowDeveloping
+    if not na(developingOriginBar) and bar_index - developingOriginBar < freshPreviewDepth
+        developingViewPrice := developingCandidate
+        developingViewOrigin := developingOriginBar
+        developingViewTime := developingOriginAt
+    if not barstate.isconfirmed and freshLeftQualifiedNow
+        developingViewPrice := math.round_to_mintick(low)
+        developingViewOrigin := bar_index
+        developingViewTime := time
+bool developingDistinct = not na(developingViewPrice) and (not freshShowConfirmed or na(freshSelectedPrice) or math.abs(developingViewPrice - freshSelectedPrice) > syminfo.mintick + freshEpsilon)
+
+if barstate.islast
+    // Current-view objects are replaced so the explicit FRESH tag stays in
+    // front of older coincident SSL labels. No historical signal is backdated.
+    if not na(freshCurrentLine)
+        line.delete(freshCurrentLine)
+        freshCurrentLine := na
+    if not na(freshCurrentLabel)
+        label.delete(freshCurrentLabel)
+        freshCurrentLabel := na
+    if not na(developingLine)
+        line.delete(developingLine)
+        developingLine := na
+    if not na(developingLabel)
+        label.delete(developingLabel)
+        developingLabel := na
+
+    if freshShowConfirmed and freshSelectedIndex >= 0
+        FreshSSLReference r = array.get(freshReferences, freshSelectedIndex)
+        bool rangeKnown = not sslRangeBroken and not na(sslMajorLow) and not na(sslMajorHigh) and sslMajorHigh > sslMajorLow
+        string role = rangeKnown and r.price > sslMajorLow + freshEpsilon and r.price < sslMajorHigh - freshEpsilon ? "iSSL" : rangeKnown and r.majorSeen and r.price <= sslMajorLow + freshEpsilon ? "eSSL" : "SSL"
+        string labelText = "FRESH " + role + " " + f_px(r.price)
+        string scaleText = r.majorSeen ? "Major confirmation also observed" : "Minor confirmed low"
+        string tip = "CONFIRMED, UNSWEPT LOW PRICE - NOT OBSERVED STOP ORDERS\n" + scaleText + "\nOrigin: " + f_stamp(r.originAt) + "\nFirst known at close: " + f_stamp(r.knownAt) + "\nMajor known: " + f_stamp(r.majorKnownAt) + "\nFresh means no penetration of at least one tick below this known point. Touching/equal lows alone do not consume it.\nInternal/external classification is used only when the range supports it; otherwise the confirmed level remains visible as SSL.\nThis current projection is not a signal that existed across earlier chart history. Institutional identity and actual stop quantity are unknown."
+        freshCurrentLine := line.new(bar_index, r.price, bar_index + projectionBars, r.price, xloc=xloc.bar_index, color=freshLevelColor, width=3)
+        freshCurrentLabel := label.new(bar_index + labelOffset, r.price, labelText, xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_right, color=color.new(freshLevelColor, 5), textcolor=color.white, size=size.small, tooltip=tip)
+    if freshShowDeveloping and developingDistinct
+        int completedRight = math.max((barstate.isconfirmed ? bar_index : bar_index - 1) - developingViewOrigin, 0)
+        string tag = "DEV SSL " + f_px(developingViewPrice) + "\nUNCONFIRMED"
+        string tip = "DEVELOPING LOW PREVIEW - NOT FRESH / CONFIRMED SSL\nCandidate bar: " + f_stamp(developingViewTime) + "\nCompleted right-side bars: " + str.tostring(completedRight) + " / " + str.tostring(freshPreviewDepth) + "\nThe price/origin may move or disappear. Native pivot confirmation, not this preview, determines confirmed registry admission.\nWhen Both scales are selected, the preview uses the internal depth."
+        developingLine := line.new(bar_index, developingViewPrice, bar_index + projectionBars, developingViewPrice, xloc=xloc.bar_index, color=developingLevelColor, style=line.style_dashed)
+        developingLabel := label.new(bar_index + labelOffset, developingViewPrice, tag, xloc=xloc.bar_index, yloc=yloc.price,
+             style=label.style_label_right, color=color.new(developingLevelColor, 35), textcolor=color.white, size=size.tiny, tooltip=tip)
+
+color freshTrackColor = na(freshSelectedPrice) ? color.new(freshLevelColor, 100) : freshLevelColor
+color developingTrackColor = developingDistinct ? developingLevelColor : color.new(developingLevelColor, 100)
+plot(freshShowConfirmed and barstate.islast ? freshSelectedPrice : na, "CURRENT FRESH SSL - confirmed unswept low", color=freshTrackColor, linewidth=2, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(freshShowDeveloping and developingDistinct and barstate.islast ? developingViewPrice : na, "CURRENT DEVELOPING SSL - UNCONFIRMED", color=developingTrackColor, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(freshReferencesCreated, "Diagnostic: confirmed lows admitted independently of range", display=display.data_window)
+plot(freshUnbreachedCount, "Diagnostic: currently fresh confirmed low references", display=display.data_window)
+plot(freshSelectedPrice, "Diagnostic: selected FRESH SSL price", display=display.data_window)
+plot(developingDistinct ? developingViewPrice : na, "Diagnostic: developing UNCONFIRMED low", display=display.data_window)
+
+// Only this connected path can create a visible OB. A generic BOS alone can
+// never call f_drawZone(). Newest eligible footprint gets first consideration.
+if barstate.isconfirmed and array.size(setups) > 0
+    for step = 0 to array.size(setups) - 1
+        FootprintSetup f = array.get(setups, array.size(setups) - 1 - step)
+        if f.active and bar_index > f.knownBar
+            // A footprint with no unconsumed high at observation may latch ONE
+            // later confirmed high from its own base/move. Once latched it can
+            // never be lowered or swapped merely to force confirmation.
+            if na(f.structure) and not na(knownStructureHigh) and not structureConsumed
+                bool newRelevantHigh = knownStructureBar > f.knownBar and knownStructureOrigin >= f.startBar and knownStructureHigh >= f.top - syminfo.mintick * 0.000001
+                if newRelevantHigh
+                    f.structure := knownStructureHigh
+                    f.structureOrigin := knownStructureOrigin
+                    f.structureKnownBar := knownStructureBar
+                    f.structureKnownAt := knownStructureAt
+
+            if not na(f.structure) and bar_index > f.structureKnownBar and na(f.breakBar) and close > f.structure + f.atr * breakClearance
+                f.breakBar := bar_index
+                f.breakAt := time_close
+
+            // Freeze source at the FIRST departure, not at an arbitrarily later
+            // strong candle. This prevents the origin drifting up the rally.
+            if na(f.departureBar) and close > f.top + f.atr * departureClearance
+                int originOffset = f_nearestBearish()
+                if na(originOffset)
+                    f_stopSetup(f, "No opposing candle before departure")
+                else
+                    int originBar = bar_index - originOffset
+                    [selectedTop, selectedBottom] = f_precisionBounds(open[originOffset], high[originOffset], low[originOffset], close[originOffset])
+                    float top = math.round_to_mintick(selectedTop)
+                    float bottom = math.round_to_mintick(selectedBottom)
+                    float invalidation = f_floorTick(low[originOffset] - math.max(priorATR * invalidationATR, syminfo.mintick * invalidationTicks))
+                    float intersection = math.max(0.0, math.min(top, f.top) - math.max(bottom, f.bottom))
+                    bool linked = originBar >= f.startBar - originPadding and intersection >= minimumLinkTicks * syminfo.mintick - syminfo.mintick * 0.000001
+                    bool valid = top - bottom >= minimumWidthTicks * syminfo.mintick - syminfo.mintick * 0.000001 and top - bottom <= maxOBWidthATR * priorATR and invalidation > 0 and invalidation <= bottom
+                    [contacts, armed, broken] = f_legState(originBar, top, bottom, invalidation, priorATR)
+                    if not linked or not valid or broken or contacts >= maxContacts
+                        // Do not search an older better-looking candle after
+                        // the actual nearest opposing origin fails the rules.
+                        f_stopSetup(f, "Initiating origin not valid / footprint-linked")
+                    else
+                        f.departureBar := bar_index
+                        f.departureAt := time_close
+                        f.originBar := originBar
+                        f.originAt := time[originOffset]
+                        f.rawOriginHigh := high[originOffset]
+                        f.rawOriginLow := low[originOffset]
+                        f.obTop := top
+                        f.obBottom := bottom
+                        f.obInvalidation := invalidation
+                        f.departureATR := priorATR
+
+            if f.active and not na(f.departureBar) and na(f.displacementBar) and strongDisplacement and bar_index - f.departureBar <= displacementGrace and close > f.top + f.atr * departureClearance
+                f.displacementBar := bar_index
+                f.displacementAt := time_close
+
+            bool eligible = (f.active and sourceInitializationReady and not na(f.displacementBar) and not na(f.breakBar)
+                 and bar_index - f.breakBar <= breakGrace
+                 and close > math.max(math.max(f.top + f.atr * breakClearance, f.structure + f.atr * breakClearance), f.obTop))
+            if eligible
+                [contacts, armed, broken] = f_legState(f.originBar, f.obTop, f.obBottom, f.obInvalidation, f.departureATR)
+                bool duplicate = false
+                if array.size(zones) > 0
+                    for i = 0 to array.size(zones) - 1
+                        FootprintOB old = array.get(zones, i)
+                        if old.originBar == f.originBar
+                            duplicate := true
+                        if old.active
+                            float shared = math.max(0.0, math.min(old.top, f.obTop) - math.max(old.bottom, f.obBottom))
+                            float smaller = math.min(old.top - old.bottom, f.obTop - f.obBottom)
+                            if smaller > 0 and shared / smaller >= duplicateOverlap
+                                duplicate := true
+                if broken or contacts >= maxContacts
+                    f_stopSetup(f, "Origin failed before final confirmation")
+                else if duplicate
+                    f.used := true
+                    f_stopSetup(f, "Already represented by a confirmed FP-OB")
+                else
+                    FootprintOB z = FootprintOB.new()
+                    z.id := nextZoneId
+                    z.footprintId := f.id
+                    z.bornBar := bar_index
+                    z.knownAt := time_close
+                    z.originBar := f.originBar
+                    z.originAt := f.originAt
+                    z.precisionMethod := precisionZoneMethod
+                    z.rawOriginHigh := f.rawOriginHigh
+                    z.rawOriginLow := f.rawOriginLow
+                    z.footprintAt := f.knownAt
+                    z.departureAt := f.departureAt
+                    z.displacementAt := f.displacementAt
+                    z.structureKnownAt := f.structureKnownAt
+                    z.breakAt := f.breakAt
+                    z.structure := f.structure
+                    z.top := f.obTop
+                    z.bottom := f.obBottom
+                    z.midpoint := math.round_to_mintick((f.obTop + f.obBottom) * 0.5)
+                    z.formationInvalidation := f.obInvalidation
+                    z.sourceBirthATR := sourceATR
+                    // Exact source initialization: no tick rounding of these
+                    // mathematical reference/stop values before comparisons.
+                    z.sourceInitialReference := f_sourceInitialReference(f.obTop, f.obBottom, sourceATR)
+                    z.sourceReference := z.sourceInitialReference
+                    z.invalidation := f.obBottom - sourceATR * sourceStopATR
+                    z.departureATR := f.departureATR
+                    z.evidenceRVOL := f.evidenceRVOL
+                    z.observations := f.observations
+                    z.evidenceRule := f.rule
+                    z.contacts := contacts
+                    z.preContacts := contacts
+                    z.armed := armed
+                    z.sslNote := sslEnabled ? f_sslContext(sslEvents, z.top, z.bottom, z.departureATR, bar_index) : ""
+                    f_drawZone(z)
+                    array.push(zones, z)
+                    f.used := true
+                    f_stopSetup(f, "Confirmed footprint-supported OB")
+                    footprintOBsCreated += 1
+                    nextZoneId += 1
+                    lastDecision := "Created FP-OB #" + str.tostring(z.id) + " from earlier footprint #" + str.tostring(f.id)
+
+// Publish current pivot knowledge after this bar's confirmation checks. All
+// footprint-specific structure references already latched remain unchanged.
+if barstate.isconfirmed
+    if not na(knownStructureHigh) and close > knownStructureHigh
+        structureConsumed := true
+    if not na(selectedHighPivot)
+        knownStructureHigh := math.round_to_mintick(selectedHighPivot)
+        knownStructureOrigin := bar_index - selectedHighDepth
+        knownStructureBar := bar_index
+        knownStructureAt := time_close
+        structureConsumed := false
+
+
+// Register current footprint evidence LAST. It cannot produce a visible zone
+// or retrospectively confirm this same candle's earlier structure event.
+if barstate.isconfirmed
+    bool singleEvidence = priorVolumeReady and f_shape(0, priorATR, supportSeries[1], priorVolumeMean, strongRVOL)
+    bool clusterBaselineReady = (not na(validVolumeBars[evidenceWindow]) and validVolumeBars[evidenceWindow] >= volumeLength
+         and not na(baseValidVolumeBars) and baseValidVolumeBars >= evidenceWindow
+         and not na(volumeMean[evidenceWindow]) and volumeMean[evidenceWindow] > 0)
+    float baseATR = atrSeries[evidenceWindow]
+    float baseVolumeMean = volumeMean[evidenceWindow]
+    float baseSupport = supportSeries[evidenceWindow]
+    int matched = 0
+    float matchedRVOL = 0.0
+    int firstOffset = 0
+    bool repeatedEvidence = false
+    float evidenceTop = high
+    float evidenceBottom = low
+    float evidenceATR = priorATR
+    float evidenceRatio = na
+    int evidenceStart = bar_index
+    int observations = 1
+    string rule = "Single high-volume rejection / absorption-style proxy"
+    if singleEvidence
+        evidenceRatio := volume / priorVolumeMean
+    else if clusterBaselineReady and f_shape(0, baseATR, baseSupport, baseVolumeMean, repeatedBarRVOL)
+        for j = 0 to evidenceWindow - 1
+            if f_shape(j, baseATR, baseSupport, baseVolumeMean, repeatedBarRVOL)
+                matched += 1
+                matchedRVOL += volume[j] / baseVolumeMean
+                firstOffset := j
+        float meanRVOL = matched > 0 ? matchedRVOL / matched : na
+        if matched >= minimumEvidenceBars and meanRVOL >= repeatedMeanRVOL
+            // Include ALL intervening candle prices, not just hand-picked bars.
+            for j = 0 to firstOffset
+                evidenceTop := math.max(evidenceTop, high[j])
+                evidenceBottom := math.min(evidenceBottom, low[j])
+            repeatedEvidence := evidenceTop - evidenceBottom <= maxBaseWidthATR * baseATR
+            evidenceATR := baseATR
+            evidenceRatio := meanRVOL
+            evidenceStart := bar_index - firstOffset
+            observations := matched
+            rule := "Repeated base-response proxy; pre-base volume reference"
+    if singleEvidence or repeatedEvidence
+        evidenceTop := math.round_to_mintick(evidenceTop)
+        evidenceBottom := math.round_to_mintick(evidenceBottom)
+        float width = evidenceTop - evidenceBottom
+        float invalidation = f_floorTick(evidenceBottom - math.max(evidenceATR * invalidationATR, invalidationTicks * syminfo.mintick))
+        bool valid = width >= minimumWidthTicks * syminfo.mintick - syminfo.mintick * 0.000001 and width <= maxBaseWidthATR * evidenceATR and invalidation > 0
+        bool duplicate = false
+        if array.size(setups) > 0
+            for i = 0 to array.size(setups) - 1
+                FootprintSetup old = array.get(setups, i)
+                float shared = width > 0 ? math.max(0.0, math.min(evidenceTop, old.top) - math.max(evidenceBottom, old.bottom)) / width : 0.0
+                if old.active and shared >= duplicateOverlap
+                    duplicate := true
+                // Do not recycle already-used observations into a new cluster.
+                if old.used and evidenceStart <= old.knownBar and bar_index - old.knownBar <= evidenceWindow + originPadding
+                    duplicate := true
+        if duplicate
+            evidenceDuplicates += 1
+        else if valid
+            FootprintSetup f = FootprintSetup.new()
+            f.id := nextSetupId
+            f.startBar := evidenceStart
+            f.knownBar := bar_index
+            f.knownAt := time_close
+            f.top := evidenceTop
+            f.bottom := evidenceBottom
+            f.atr := evidenceATR
+            f.invalidation := invalidation
+            f.rule := rule
+            f.evidenceRVOL := evidenceRatio
+            f.observations := observations
+            if not na(knownStructureHigh) and not structureConsumed
+                f.structure := knownStructureHigh
+                f.structureOrigin := knownStructureOrigin
+                f.structureKnownBar := knownStructureBar
+                f.structureKnownAt := knownStructureAt
+            array.push(setups, f)
+            footprintsObserved += 1
+            nextSetupId += 1
+            lastDecision := "Footprint #" + str.tostring(f.id) + " observed internally; NOT drawn until the whole sequence confirms"
+
+    while array.size(setups) > maxPendingSetups
+        int removeIndex = 0
+        bool found = false
+        for i = 0 to array.size(setups) - 1
+            FootprintSetup f = array.get(setups, i)
+            if not f.active and not found
+                removeIndex := i
+                found := true
+        FootprintSetup removed = array.remove(setups, removeIndex)
+        if removed.active
+            f_stopSetup(removed, "Internal record cap")
+    while array.size(zones) > maxZones
+        int removeIndex = 0
+        bool found = false
+        for i = 0 to array.size(zones) - 1
+            FootprintOB z = array.get(zones, i)
+            if not z.active and not found
+                removeIndex := i
+                found := true
+        FootprintOB removed = array.remove(zones, removeIndex)
+        if removed.active
+            f_retireZone(removed, "Record cap, no longer tracked")
+        f_deleteZone(removed)
+
+// LIVE SOURCE TAP PASS, after confirmed FP creation and storage pruning,
+// matching the source's create -> prune -> live TAP order. No bar-close gate.
+bool anySourceApproach = false
+bool anySourceTap = false
+bool anySourceDefence = false
+bool anySourceDead = false
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        FootprintOB z = array.get(zones, i)
+        [approach, tapped, defended, dead] = f_sourceTapStep(z)
+        anySourceApproach := anySourceApproach or approach
+        anySourceTap := anySourceTap or tapped
+        anySourceDefence := anySourceDefence or defended
+        anySourceDead := anySourceDead or dead
+
+// Compact confirmed-zone view. No tentative drawings or generic OB fallback.
+float referenceClose = barstate.isconfirmed ? close : close[1]
+float nearestTop = na
+float nearestBottom = na
+float nearestMid = na
+float nearestFailure = na
+float nearestSourceReference = na
+int nearestSourceTaps = na
+float nearestDistance = na
+color nearestColor = zoneColor
+int activeZones = 0
+int activeFootprints = 0
+if array.size(setups) > 0
+    for i = 0 to array.size(setups) - 1
+        FootprintSetup f = array.get(setups, i)
+        if f.active
+            activeFootprints += 1
+if array.size(zones) > 0
+    for i = 0 to array.size(zones) - 1
+        FootprintOB z = array.get(zones, i)
+        if z.active
+            activeZones += 1
+            float distance = referenceClose > z.top ? referenceClose - z.top : referenceClose < z.bottom ? z.bottom - referenceClose : 0.0
+            if not na(referenceClose) and (na(nearestDistance) or distance < nearestDistance)
+                nearestDistance := distance
+                nearestTop := z.top
+                nearestBottom := z.bottom
+                nearestMid := z.midpoint
+                nearestFailure := z.invalidation
+                nearestSourceReference := z.sourceReference
+                nearestSourceTaps := z.sourceTaps
+                nearestColor := f_sourceColor(z)
+            if barstate.islast
+                int end = bar_index + projectionBars
+                if not na(z.area)
+                    box.set_right(z.area, end)
+                if not na(z.proximal)
+                    line.set_x2(z.proximal, end)
+                if not na(z.distal)
+                    line.set_x2(z.distal, end)
+                if not na(z.middle)
+                    line.set_x2(z.middle, end)
+                if not na(z.failure)
+                    line.set_x2(z.failure, end)
+                if not na(z.sourceReferenceLine)
+                    line.set_x2(z.sourceReferenceLine, end)
+                if not na(z.priceLabel)
+                    label.set_x(z.priceLabel, bar_index + labelOffset)
+                    label.set_text(z.priceLabel, f_zoneText(z))
+                    label.set_tooltip(z.priceLabel, f_zoneTip(z))
+
+// Current reference tracks, not assertions that a signal existed in the past.
+plot(showPriceTracks ? nearestTop : na, "Live FP-OB proximal", color=nearestColor, linewidth=2, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(showPriceTracks ? nearestBottom : na, "Live FP-OB distal", color=nearestColor, linewidth=2, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(showPriceTracks and showMidpoint ? nearestMid : na, "Live FP-OB midpoint", color=midpointColor, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(showPriceTracks and showInvalidation ? nearestFailure : na, "Live fixed source stop reference", color=invalidationColor, style=plot.style_linebr, trackprice=true, show_last=1)
+// Original TAP circle placement retained; no buy/sell orders or alerts added.
+plotshape(sourceShowTapCircle and anySourceTap, title="Source-compatible TAP (live/provisional)", style=shape.circle, location=location.belowbar, color=sourceTapColor, size=size.tiny, text="TAP")
+plot(showPriceTracks ? nearestSourceReference : na, "Current source TAP reference (not a fill)", color=nearestColor, linewidth=2, style=plot.style_linebr, trackprice=true, show_last=1)
+plot(nearestSourceTaps, "Source TAP count on nearest active FP zone", display=display.data_window)
+plot(sourceRVOL, "Source current-inclusive RVOL", display=display.data_window)
+plot(anySourceTap ? 1 : 0, "Source TAP condition this bar", display=display.data_window)
+plot(anySourceDefence ? 1 : 0, "Source defence condition this bar", display=display.data_window)
+plot(anySourceDead ? 1 : 0, "Source invalidity this bar", display=display.data_window)
+// Silent inspection fields; no table or second chart pane.
+plot(footprintsObserved, "Diagnostic: internal footprints observed", display=display.data_window)
+plot(activeFootprints, "Diagnostic: pending footprints, NOT chart signals", display=display.data_window)
+plot(footprintOBsCreated, "Diagnostic: confirmed footprint-supported OBs", display=display.data_window)
+plot(activeZones, "Diagnostic: live confirmed footprint-supported OBs", display=display.data_window)
+plot(sslCreated, "Diagnostic: SSL price references", display=display.data_window)
+// Intentionally no table, large information label, strategy orders or alerts.
