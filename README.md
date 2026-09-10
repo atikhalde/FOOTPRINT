@@ -100,6 +100,28 @@ reclaim** — a liquidity grab — which the message marks).
 
 ---
 
+## GitHub Actions: Scanner and Backtest
+
+The **Actions** tab includes two workflows:
+
+* **Scanner** — scheduled every 15 minutes on weekdays (UTC), running
+  `scan --once` rather than an infinite loop. Add repository Actions secrets
+  `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for live alerts. Manual runs default
+  to **dry run**; uncheck it to send alerts. Optional `symbols` overrides the
+  configured universe. Live runs restore/save deduplication state using Actions
+  cache and do not overlap; dry runs do not change the live cache. Cache eviction
+  can reset deduplication. Push runs only perform an offline synthetic smoke test.
+* **Backtest** — choose **Run workflow** to select Yahoo or synthetic data,
+  strategy, optional symbols, and history bars (200–20000). Results appear in the
+  run summary and a downloadable artifact containing the CSV/text reports (30-day
+  retention). Push/PR runs execute engine tests and a synthetic backtest without
+  Telegram credentials or market-data access.
+
+Merge the workflows into the repository's **default branch** to enable schedules
+and the manual **Run workflow** buttons. GitHub schedules are best-effort and may
+be delayed; use the supervised scanner below when precise continuous polling is
+required. Synthetic results are demo data, not real market performance.
+
 ## Running it 24/7 on a live market
 
 The scanner is a plain Python loop (`scan`), safe to run under any supervisor:

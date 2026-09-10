@@ -1,0 +1,86 @@
+name: Backtest
+
+on:
+  push:
+    paths:
+      - '.github/workflows/backtest.yml'
+      - 'fpfssl/**'
+      - 'tests/**'
+      - 'requirements.txt'
+      - 'config.yaml'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      source:
+        description: Data source (synthetic is demo data, not market data)
+        type: choice
+        options:
+          - yahoo
+          - synthetic
+        default: yahoo
+      strategy:
+        description: Signal strategy
+        type: choice
+        options:
+          - essl_ob_tap
+          - ob_tap
+          - essl_sweep
+        default: essl_ob_tap
+      symbols:
+        description: Comma-separated tickers (blank uses config.yaml)
+        type: string
+        default: ''
+      bars:
+        description: History bars per symbol
+        type: string
+        default: '1500'
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SOURCE: ${{ inputs.source || 'synthetic' }}
+      STRATEGY: ${{ inputs.strategy || 'essl_ob_tap' }}
+      SYMBOLS: ${{ inputs.symbols }}
+      BARS: ${{ inputs.bars || '1500' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Engine scenario tests
+        run: python tests/test_engine.py
+      - name: Run backtest
+        shell: bash
+        run: |
+          if [[ ! "$BARS" =~ ^[0-9]+$ ]] || (( BARS < 200 || BARS > 20000 )); then
+            echo '::error::History bars must be an integer between 200 and 20000.'
+            exit 1
+          fi
+          args=(backtest --source "$SOURCE" --strategy "$STRATEGY" --bars "$BARS")
+          if [[ -n "$SYMBOLS" ]]; then
+            args+=(--symbols "$SYMBOLS")
+          fi
+          python -m fpfssl "${args[@]}"
+          echo "## Backtest — $SOURCE / $STRATEGY" >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$SOURCE" == "synthetic" ]]; then
+            echo '**Synthetic demo data — not real market performance.**' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          for report in output/backtest_*/summary.txt; do
+            printf '\n```text\n' >> "$GITHUB_STEP_SUMMARY"
+            cat "$report" >> "$GITHUB_STEP_SUMMARY"
+            printf '\n```\n' >> "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Upload backtest reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-${{ env.SOURCE }}-${{ env.STRATEGY }}-${{ github.run_id }}
+          path: output/backtest_*/
+          if-no-files-found: error
+          retention-days: 30
