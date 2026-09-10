@@ -127,7 +127,13 @@ class EngineConfig:
 class DataConfig:
     source: str = "yahoo"                # yahoo | csv | synthetic
     csv_dir: str = "data"
-    history_bars: int = 500              # bars to keep for the scanner
+    # Minimum history the scanner wants. The LIVE scanner must NOT cut the
+    # frame down to this: the engine's footprint-TAP state machine is
+    # path-dependent (a zone born 600 bars ago can be tapped today), so every
+    # bar the feed gives is state the live pass needs. `max_bars` is the only
+    # hard cap (0 = keep everything the source returned).
+    history_bars: int = 500
+    max_bars: int = 0                    # hard cap on loaded bars (0 = unlimited)
     interval: str = "1d"                 # yfinance TF: 1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo
     period: str | None = None            # yfinance period override (auto from interval when None)
     prepost: bool = False                # include pre/post market (NSE: keep False)
@@ -161,6 +167,13 @@ class ScannerConfig:
     market_open: str = "09:15"           # NSE equity session open (IST, HH:MM)
     market_close: str = "15:30"          # NSE equity session close (IST, HH:MM)
     recent_bars: int = 3                 # only the last N bars can raise new alerts
+    # `scan` without --once polls until this many minutes past the close, so the
+    # final bar (15:15-15:30) is still alerted once the feed settles.
+    stop_after_close_minutes: float = 15.0
+    # `scan` without --once waits for the open only when it is this close;
+    # started further out it runs a single pass and exits (scheduled ticks are
+    # cheap, holding a 6h runner for nothing is not).
+    preopen_wait_minutes: float = 60.0
 
 
 @dataclass

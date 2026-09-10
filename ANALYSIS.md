@@ -355,3 +355,69 @@ Known-faithful edge behaviours preserved (each has a test or code comment):
 * **Parameter sensitivity**: 40+ inputs; the defaults are the script author's, and the
   composite signal is deliberately rare (a deep pullback that *both* taps a major low
   *and* satisfies a confirmed OB's TAP reference on the same bar).
+
+---
+
+## 10. Live scanner: how the port runs it, and the history-window fix
+
+The indicator is a *state machine over history*, not a stateless formula. The
+scanner therefore cannot evaluate "the last bar" alone — every poll re-runs the
+engine over the full frame and reads the events the engine publishes for the
+recent bars. Three consequences drove the fixes in this revision.
+
+### 10.1 The frame must not be trimmed (the "no alerts in live market" bug)
+
+The scanner used to run the engine on `df.tail(history_bars)` — 500 bars by
+default. That silently deleted state the TAP machine needs:
+
+* a footprint OB is created from evidence → departure → displacement →
+  buffered structure break, and is then **tracked until it is tapped or
+  invalidated** — the zone's birth can be hundreds of bars before the tap;
+* measured on synthetic 15m data (n = 107 TAPs): zone age at tap had
+  **median 81 bars, p75 261, max 848**;
+* replaying the *same* composite bar with different truncation windows
+  (n = 38 composites): a 300-bar window reproduced 33/38, 500 → 34/38,
+  1000 → 36/38, 1500 → 38/38. Every loss was the eSSL half (its pools are
+  age-capped at `ssl_max_age`), while the footprint half could vanish
+  completely — e.g. seed 17 of the offline generator has a composite whose zone
+  is **640 bars old**: on a 500-bar window the TAP, the invalidation and the
+  composite all disappear and only a bare eSSL tap survives.
+
+So the live pass now runs on everything the feed serves (`data.max_bars` is the
+only cap, `0` = keep all; Yahoo serves ~1500 bars of 15m within its 60-day
+intraday window). `tests/test_live_scanner.py` pins this with a composite whose
+zone is 685 bars old — it fails against the trimmed implementation.
+
+### 10.2 Alerts: same bar, same rules, LIVE vs confirmed
+
+* The composite (`essl_ob_tap`) is the source requirement verbatim: on one bar,
+  an active eSSL level is tapped **and** a confirmed FP-OB's source-TAP
+  condition fires. On 15m data that is genuinely rare — measure it on your own
+  universe with `backtest --strategy essl_ob_tap` rather than expecting a
+  daily stream.
+* The forming last bar goes through section (G) (TAP) and the group-8
+  forming-bar eSSL pass, so a LIVE alert can be sent mid-bar; the closed bar
+  has a distinct dedupe key (and is normally suppressed by the cooldown).
+* Dedupe key = `symbol | interval | event | bar-time | confirmed? | zone/pool`.
+  Cooldown = per `symbol+event`, so distinct signals of the same kind inside the
+  window collapse into one message.
+
+### 10.3 Scheduling reality
+
+GitHub's `schedule` trigger is best-effort: ticks are delayed 5–30 minutes
+under load and high-frequency ticks are dropped (in this repository's history
+one tick fired where sixteen were expected). Any design that needs ~96 ticks to
+cover a 6-hour session is therefore unreliable by construction. The workflow
+instead starts **one long-lived job** per trigger that polls internally until
+the close, with a `concurrency` group serialising runs, so a single surviving
+tick covers the whole session; late ticks queue and take over. For guaranteed
+timing, run `python -m fpfssl scan` under systemd, or trigger the workflow from
+an external scheduler (`workflow_dispatch`/`repository_dispatch`).
+
+### 10.4 Silent-dry-run trap
+
+`telegram.dry_run: true` makes every alert print to the log instead of being
+sent, and nothing else in the pipeline complains. The CI workflow now passes
+`--no-dry-run` on real runs, `scan` warns loudly when Telegram is not
+configured, and `python -m fpfssl diagnose` prints the live state of every rule
+so a quiet session can be told apart from a broken one.

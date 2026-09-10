@@ -108,6 +108,10 @@ def run_backtest(
             print(f"  ! {sym}: data error: {e}")
             continue
         n_ok += 1
+        # `--bars` caps the backtest window (the data layer no longer truncates:
+        # the live scanner needs every bar the feed serves).
+        if data_cfg.history_bars and len(df) > data_cfg.history_bars * 2:
+            df = df.tail(data_cfg.history_bars * 2)
         # trading window: signals only from bt.start, but keep warmup BEFORE
         # start so ATR/MA/pivot state is fully warmed (event bar indices stay
         # aligned with this df — the engine runs on it)

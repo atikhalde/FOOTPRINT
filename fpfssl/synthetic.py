@@ -1,9 +1,13 @@
-"""Deterministic synthetic daily OHLCV generator.
+"""Deterministic synthetic OHLCV generators (daily + intraday).
 
-Purpose: offline demos and engine tests in environments without market-data
-access (e.g. CI sandboxes). Produces regime-switching random walks with
-volume clustering, so footprint/evidence bars, pivot lows and deep pullbacks
-all occur. NOT real market data.
+Purpose: offline demos and engine/scanner tests in environments without
+market-data access (e.g. CI sandboxes). Produces regime-switching random
+walks with volume clustering, so footprint/evidence bars, pivot lows and deep
+pullbacks all occur. NOT real market data.
+
+`generate` produces daily bars; `generate_intraday` produces exchange-session
+bars (09:15-15:30 IST, weekdays) so the live scanner path — forming last bar,
+tick rounding, HH:MM bar stamps — can be exercised offline.
 """
 from __future__ import annotations
 
@@ -80,6 +84,87 @@ def generate(symbol: str, cfg: DataConfig, bars: int | None = None) -> pd.DataFr
     # (rounding can otherwise leave high < low or high < max(open, close))
     for col in ("open", "high", "low", "close"):
         df[col] = np.round(df[col], 2)
+    df["high"] = df[["open", "high", "low", "close"]].max(axis=1)
+    df["low"] = df[["open", "low", "close"]].min(axis=1)
+    df["volume"] = df["volume"].astype(int)
+    return df
+
+
+def _ticks(symbol: str) -> float:
+    sym = (symbol or "").upper()
+    return 0.05 if (sym.endswith(".NS") or sym.endswith(".BO")) else 0.01
+
+
+def session_index(days: int, minutes: int = 15, end: pd.Timestamp | None = None) -> pd.DatetimeIndex:
+    """Weekday exchange sessions of `minutes` bars starting 09:15 (IST wall time)."""
+    per_day = int(375 / minutes)
+    end = (end or pd.Timestamp.today()).normalize()
+    stamps: list[pd.Timestamp] = []
+    d = end
+    while len(stamps) < days * per_day:
+        if d.weekday() < 5:
+            day: list[pd.Timestamp] = []
+            t = d.replace(hour=9, minute=15)
+            stop = d.replace(hour=15, minute=30)
+            while t < stop and len(day) < per_day:
+                day.append(t)
+                t += pd.Timedelta(minutes=minutes)
+            stamps = day + stamps
+        d -= pd.Timedelta(days=1)
+    idx = pd.DatetimeIndex(stamps[-days * per_day:])
+    idx.name = "date"
+    return idx
+
+
+def generate_intraday(symbol: str, cfg: DataConfig, days: int | None = None,
+                      minutes: int = 15, seed: int | None = None) -> pd.DataFrame:
+    """Deterministic intraday OHLCV ending at the last completed session.
+
+    Tick-rounded (0.05 for .NS/.BO), volume clustered and spiked so the
+    evidence/RVOL and pivot machinery both fire, with enough range to create
+    footprint OBs and eSSL pools — i.e. the same feature mix the live scanner
+    sees, without touching the network.
+    """
+    tick = _ticks(symbol)
+    if minutes not in (1, 2, 5, 15, 30, 60):
+        minutes = 15
+    days = int(days or max(10, cfg.history_bars // int(375 / minutes) + 1))
+    idx = session_index(days, minutes)
+    n = len(idx)
+    s = (SEED_BASE + int(zlib.crc32(symbol.encode("utf-8")) % 100_000)
+         if seed is None else int(seed))
+    rng = np.random.default_rng(s)
+    p0 = 250.0 + (s % 4000) / 2.0
+
+    # per-bar vol scaled to the bar length; slow swings create pivot lows/highs
+    scale = (minutes / 15.0) ** 0.5
+    swing = np.sin(np.arange(n) / (95.0 / scale)) * 0.35 * scale
+    ret = rng.normal(0, 0.0016 * scale, n) + np.diff(np.concatenate([[0.0], swing])) * 0.004
+    close = p0 * np.exp(np.cumsum(ret))
+    op = np.empty(n)
+    op[0] = close[0] * (1 + rng.normal(0, 0.0005))
+    op[1:] = close[:-1] * (1 + rng.normal(0, 0.0005, n - 1))
+    body = np.abs(close - op)
+    wick = np.abs(rng.normal(0, 1, n)) * 0.0011 * scale * close + body
+    hi = np.maximum(op, close) + rng.uniform(0.05, 1.0, n) * wick
+    lo = np.minimum(op, close) - rng.uniform(0.05, 1.0, n) * wick
+
+    vol = 250_000.0 * np.exp(rng.normal(0, 0.35, n))
+    spikes = rng.random(n) < 0.11
+    vol[spikes] *= rng.uniform(1.8, 4.5, int(spikes.sum()))
+    # absorption bars: high volume, small body, close near the high
+    for i in rng.choice(n, size=max(1, n // 25), replace=False):
+        mid = (op[i] + close[i]) * 0.5
+        op[i], close[i] = mid, mid * (1 + rng.uniform(0.0004, 0.003))
+        lo[i] = min(op[i], close[i]) * (1 - rng.uniform(0.0008, 0.005))
+        hi[i] = max(op[i], close[i]) * (1 + rng.uniform(0.0008, 0.0025))
+        vol[i] *= rng.uniform(2.0, 4.0)
+
+    df = pd.DataFrame({"open": op, "high": hi, "low": lo, "close": close,
+                       "volume": vol}, index=idx)
+    df.index.name = "date"
+    for col in ("open", "high", "low", "close"):
+        df[col] = np.round(df[col] / tick) * tick
     df["high"] = df[["open", "high", "low", "close"]].max(axis=1)
     df["low"] = df[["open", "low", "close"]].min(axis=1)
     df["volume"] = df["volume"].astype(int)
