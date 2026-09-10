@@ -69,7 +69,7 @@ scanner:
 
 telegram:
   enabled: true
-  dry_run: false         # true = print messages to console instead of sending
+  dry_run: true         # true = print messages to console instead of sending
   token: null            # or env var TELEGRAM_BOT_TOKEN (recommended)
   chat_id: null          # or env var TELEGRAM_CHAT_ID
   api_base: https://api.telegram.org
