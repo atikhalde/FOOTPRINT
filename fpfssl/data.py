@@ -8,7 +8,6 @@ from __future__ import annotations
 import io
 import os
 
-import numpy as np
 import pandas as pd
 
 from .config import DataConfig
@@ -49,7 +48,9 @@ def load_yahoo(symbol: str, cfg: DataConfig) -> pd.DataFrame:
         raise DataError("yfinance is not installed (pip install yfinance)") from e
     start = cfg.start or "2020-01-01"
     end = cfg.end
-    df = yf.Ticker(symbol).history(start=start, end=end, interval="1d", auto_adjust=False)
+    # auto_adjust=True: split/dividend-adjusted OHLC, so ATR/pivots see a
+    # continuous price series (unadjusted data injects fake gaps on ex-div dates)
+    df = yf.Ticker(symbol).history(start=start, end=end, interval="1d", auto_adjust=True)
     df = _normalize(df, symbol)
     if len(df) > cfg.history_bars * 2:
         df = df.tail(cfg.history_bars * 2)

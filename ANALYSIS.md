@@ -121,11 +121,20 @@ close, not a future value.
 On a hit, a `FootprintSetup` is registered with:
 
 ```
-top/bottom  = rounded evidence high/low
+top/bottom  = rounded evidence high/low — for REPEATED evidence these are the
+              UNION of ALL candles from the current bar back to the oldest
+              matched bar (not just the current candle)
+startBar    = evidenceStart: the current bar (single) or bar_index − firstOffset
+              (repeated: the OLDEST matched bar of the cluster)
 atr         = priorATR (single) or baseATR (repeated)
 invalidation = floorTick(bottom − max(0.10 × atr, 1 tick))
 structure   = latched to the known structure high if one exists and is unconsumed
 ```
+
+`startBar` matters downstream: the structure latch requires
+`knownStructureOrigin >= f.startBar`, the departure link check requires
+`originBar >= f.startBar − 3`, and the duplicate check refuses to recycle
+observations (`evidenceStart <= old.knownBar`).
 
 Duplicate suppression: a new base overlapping `≥ 75%` of an active pending base, or
 recycling observations already consumed by a used setup, is rejected.

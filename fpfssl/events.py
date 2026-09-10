@@ -150,7 +150,7 @@ def format_event(symbol: str, tf: str, ev: Event) -> str:
         title = "eSSL TAP — price tapped external sell-side liquidity"
         head = _head(symbol, tf, ev, title, "💧")
         parts = [head, _essl_line(ev)]
-        parts.append("   (eSSL tap on its own — no footprint TAP on this bar)")
+        parts.append("   (standalone eSSL tap — no footprint TAP on this bar)")
         return "\n".join(parts)
     if ev.kind == K_ESSL_SWEEP:
         head = _head(symbol, tf, ev, "eSSL SWEEP + RECLAIM — liquidity grabbed at external low", "🌀")

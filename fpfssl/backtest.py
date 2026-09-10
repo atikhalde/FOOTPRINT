@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -25,7 +25,7 @@ import pandas as pd
 from .config import BacktestConfig, DataConfig, EngineConfig
 from .data import load_symbol
 from .engine import Engine, detect_tick
-from .events import K_DEFENCE, K_ESSL_SWEEP, K_ESSL_TAP, K_TAP
+from .events import K_ESSL_SWEEP, K_ESSL_TAP, K_TAP
 
 
 @dataclass
@@ -64,10 +64,12 @@ def _signals_by_bar(res, strategy: str, entry_tap: int):
     for ev in res.events:
         if not ev.confirmed:
             continue
-        if strategy in ("essl_ob_tap",) and ev.kind == K_ESSL_TAP:
+        if strategy == "essl_ob_tap" and ev.kind == K_ESSL_TAP:
             sig.setdefault(ev.bar, {})["essl"] = ev
         elif strategy in ("essl_ob_tap", "ob_tap") and ev.kind == K_TAP:
-            if entry_tap and ev.extra.get("taps", 1) != entry_tap:
+            # entry_tap filtering applies to the plain ob_tap strategy only;
+            # the composite counts every qualifying bar (any tap number)
+            if strategy == "ob_tap" and entry_tap and ev.extra.get("taps", 1) != entry_tap:
                 continue
             sig.setdefault(ev.bar, {})["tap"] = ev
         elif strategy == "essl_sweep" and ev.kind == K_ESSL_SWEEP:
@@ -82,20 +84,40 @@ def run_backtest(
     bt: BacktestConfig,
     out_dir: str = "output",
 ) -> BacktestReport:
+    import copy
+
     all_trades: list[Trade] = []
-    bars_per_symbol: dict[str, pd.DataFrame] = {}
     event_rows: list[dict] = []
+    n_ok = 0
+
+    # the engine needs warmup history BEFORE the trading window; make sure the
+    # data fetch starts early enough (ATR/MA seed, pivots, baselines)
+    fetch_cfg = copy.deepcopy(data_cfg)
+    if bt.start:
+        need_start = pd.Timestamp(bt.start) - pd.Timedelta(days=200)
+        cur = pd.Timestamp(fetch_cfg.start) if fetch_cfg.start else None
+        if cur is None or cur > need_start:
+            fetch_cfg.start = need_start.strftime("%Y-%m-%d")
 
     for sym in symbols:
         try:
-            df = load_symbol(sym, data_cfg)
+            df = load_symbol(sym, fetch_cfg)
         except Exception as e:  # noqa: BLE001
             print(f"  ! {sym}: data error: {e}")
             continue
+        n_ok += 1
+        # trading window: signals only from bt.start, but keep ~180 days of
+        # warmup BEFORE start so ATR/MA/pivot state is fully warmed (event
+        # bar indices stay aligned with this df — the engine runs on it)
+        if bt.start:
+            warm_start = pd.Timestamp(bt.start) - pd.Timedelta(days=180)
+            df = df[df.index >= warm_start]
+            trade_from = int(df.index.searchsorted(pd.Timestamp(bt.start)))
+        else:
+            trade_from = 0
         tick = data_cfg.tick_overrides.get(sym, detect_tick(df))
         eng = Engine(sym, engine_cfg, tick)
         res = eng.run(df, live_last_bar=False)
-        bars_per_symbol[sym] = df
         for ev in res.events:
             event_rows.append({
                 "symbol": sym, "date": ev.date, "kind": ev.kind, "confirmed": ev.confirmed,
@@ -104,13 +126,12 @@ def run_backtest(
                 "reference": ev.extra.get("reference"), "stop": ev.extra.get("invalidation"),
                 "reason": ev.extra.get("reason"),
             })
-        if bt.start:
-            df = df[df.index >= pd.Timestamp(bt.start)]
-        print(f"  √ {sym}: {len(df)} bars → footprints {res.counters.get('footprints_observed', 0)}, "
-              f"OBs {res.counters.get('footprint_ob_created', 0)}, taps {res.counters.get('taps', 0)}, "
-              f"eSSL taps {res.counters.get('essl_taps', 0)}, sweeps {res.counters.get('essl_sweeps', 0)}")
+        print(f"  √ {sym}: {max(len(df) - trade_from, 0)} trade-window bars → footprints "
+              f"{res.counters.get('footprints_observed', 0)}, OBs {res.counters.get('footprint_ob_created', 0)}, "
+              f"taps {res.counters.get('taps', 0)}, eSSL taps {res.counters.get('essl_taps', 0)}, "
+              f"sweeps {res.counters.get('essl_sweeps', 0)}")
 
-        sigs = _signals_by_bar(res, bt.strategy, bt.entry_tap)
+        sigs = {t: v for t, v in _signals_by_bar(res, bt.strategy, bt.entry_tap).items() if t >= trade_from}
         o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
         atr = res.atr
         dates = [d.strftime("%Y-%m-%d") for d in df.index]
@@ -184,16 +205,16 @@ def run_backtest(
     if len(trades_df):
         trades_df = trades_df.sort_values(["entry_date", "symbol"]).reset_index(drop=True)
 
-    # equity curve (fixed fractional risk, per-trade)
+    # equity curve (fixed fractional risk, per-trade, in completion order)
     equity = []
     if len(all_trades):
         cash = bt.initial_capital
-        for t in all_trades:
+        for t in sorted(all_trades, key=lambda t: (t.exit_date, t.entry_date, t.symbol)):
             r = t.r_multiple
             cash *= (1.0 + bt.risk_per_trade * r)
             equity.append({"date": t.exit_date, "symbol": t.symbol, "r": r, "equity": round(cash, 2)})
     equity_df = pd.DataFrame(equity)
-    summary = _summarize(bt, all_trades, equity_df, len(symbols))
+    summary = _summarize(bt, all_trades, equity_df, n_ok)
     per_symbol = (
         trades_df.groupby("symbol").agg(
             trades=("symbol", "size"),

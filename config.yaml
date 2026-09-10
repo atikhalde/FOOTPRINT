@@ -52,6 +52,9 @@ scanner:
     - defence            # source defence confirmed after a TAP
     - zone_invalid       # OB invalidated (stop) or touch limit exceeded
     - essl_created       # new eSSL reference published (fresh major low)
+    # optional (off by default — add to the list to enable):
+    # - essl_tap         # every standalone eSSL tap (no footprint TAP that bar)
+    # - footprint_created# every newly confirmed FP-OB (TAP armed at its reference)
 
 telegram:
   enabled: true

@@ -6,7 +6,7 @@ script).  See ANALYSIS.md for what each group means.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -147,7 +147,7 @@ class ScannerConfig:
     ])
     provisional_alerts: bool = True      # also alert on the still-forming intraday bar (marked LIVE)
     alert_cooldown_minutes: float = 60.0
-    min_bars: int = 200                  # skip symbols with too little history
+    min_bars: int = 300                  # skip symbols with too little history (engine warmup)
     max_stale_days: int = 4              # skip symbols whose last bar is older than this
 
 

@@ -107,7 +107,10 @@ class LiveScanner:
             return 0
         df = df.tail(cfg.data.history_bars)
         tick = cfg.data.tick_overrides.get(sym, detect_tick(df))
-        live_last = cfg.data.source == "yahoo"
+        # only the bar that is actually forming today is provisional; on
+        # weekends/holidays the last bar is already closed
+        live_last = (cfg.data.source == "yahoo"
+                     and df.index[-1].date() == datetime.now().date())
         res = Engine(sym, cfg.engine, tick).run(df, live_last_bar=live_last)
         c = res.counters
         log.info("%s: %d bars | OBs %d (active %d) | taps %d | eSSL taps %d | active eSSL %d | fresh %d",
@@ -130,8 +133,9 @@ class LiveScanner:
                 d["other"].append(ev)
 
         for date, d in sorted(by_date.items()):
+            composite_bar = d["tap"] is not None and d["essl"] is not None
             # composite: ALL RULES = eSSL tap + footprint tap on the same bar
-            if "essl_ob_tap" in want and d["tap"] is not None and d["essl"] is not None:
+            if "essl_ob_tap" in want and composite_bar:
                 tap, essl = d["tap"], d["essl"]
                 provisional = not tap.confirmed
                 if not (provisional and not sc.provisional_alerts):
@@ -143,6 +147,10 @@ class LiveScanner:
             singles = []
             if d["tap"] is not None and "footprint_tap" in want:
                 singles.append(("footprint_tap", d["tap"], d["tap"].zone_id))
+            # standalone eSSL tap (opt-in); suppressed when the composite fired
+            if d["essl"] is not None and "essl_tap" in want and not composite_bar:
+                ev = d["essl"]
+                singles.append(("essl_tap", ev, ev.pool_id))
             for ev in d["other"]:
                 mapping = {
                     K_DEFENCE: "defence",

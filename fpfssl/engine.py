@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -404,12 +404,15 @@ class Engine:
 
         ssl_major_low: Optional[float] = None
         ssl_major_high: Optional[float] = None
+        # *_origin mirrors Pine's tracked state (used by display there); kept
+        # for 1:1 state parity even though the engine logic doesn't read them.
         ssl_major_low_origin = ssl_major_high_origin = -1
         ssl_last_major_low_obs = ssl_last_major_high_obs = ssl_last_minor_obs = ssl_last_extern_issued = -1
         ssl_range_key = 0
         ssl_range_broken = False
 
         fresh_last_minor_origin = fresh_last_major_origin = -1
+        # developing preview: display-only in the source; tracked for parity
         dev_candidate: Optional[float] = None
         dev_origin_bar = -1
 
@@ -691,6 +694,8 @@ class Engine:
 
             # (C) FRESH SSL registry + developing preview ------------------------
             fresh_on = cfg.fresh_show_confirmed or cfg.fresh_show_developing
+            # Pine: freshPreviewDepth = External ? externalDepth : internalDepth
+            fresh_preview_depth = cfg.ssl_external_depth if cfg.fresh_low_source == "External" else cfg.ssl_internal_depth
             if confirmed and fresh_on:
                 for r in fresh_refs:
                     if r.active and t > r.known_bar and l[t] <= r.price - tick + eps:
@@ -708,19 +713,24 @@ class Engine:
                         fresh_last_major_origin = origin
                 # developing preview (display-only in the source; kept for parity)
                 prev_low_ref = np.nan
-                if t >= cfg.ssl_internal_depth:
-                    prev_low_ref = min(l[t - cfg.ssl_internal_depth:t])
-                if t >= cfg.ssl_internal_depth and not math.isnan(prev_low_ref) and l[t] > 0 and l[t] <= prev_low_ref:
+                if t >= fresh_preview_depth:
+                    prev_low_ref = min(l[t - fresh_preview_depth:t])
+                if t >= fresh_preview_depth and not math.isnan(prev_low_ref) and l[t] > 0 and l[t] <= prev_low_ref:
                     dev_candidate = round_tick(l[t], tick)
                     dev_origin_bar = t
-                if dev_origin_bar >= 0 and t - dev_origin_bar >= cfg.ssl_internal_depth:
+                if dev_origin_bar >= 0 and t - dev_origin_bar >= fresh_preview_depth:
                     dev_candidate = None
                     dev_origin_bar = -1
                 while len(fresh_refs) > cfg.fresh_record_cap:
-                    idx, oldest = -1, None
+                    # Pine: prefer the oldest INACTIVE reference; otherwise the
+                    # oldest origin overall.
+                    idx, oldest_origin, found_inactive = -1, None, False
                     for i, r in enumerate(fresh_refs):
-                        if idx == -1 or (r.origin_bar < (oldest or 0)):
-                            idx, oldest = i, r.origin_bar
+                        if not r.active:
+                            if not found_inactive or r.origin_bar < oldest_origin:
+                                idx, oldest_origin, found_inactive = i, r.origin_bar, True
+                        elif not found_inactive and (idx == -1 or r.origin_bar < oldest_origin):
+                            idx, oldest_origin = i, r.origin_bar
                     fresh_refs.pop(idx)
 
             # (D) confirmation state machine (newest setup first) -----------------
@@ -861,6 +871,13 @@ class Engine:
                 observations, rule = 1, "Single high-volume rejection / absorption-style proxy"
                 evidence_ratio = 0.0
                 evidence_atr = prior_atr[t]
+                # Pine: evidenceTop/Bottom start at the current bar's high/low;
+                # the repeated branch WIDENS them to the union of ALL intervening
+                # candles (0..firstOffset), and evidenceStart moves to the
+                # OLDEST matched bar (bar_index - firstOffset).
+                evidence_top = h[t]
+                evidence_bottom = l[t]
+                evidence_start = t
                 if single:
                     evidence_ratio = v[t] / prior_volma[t]
                 elif cluster_ready and f_shape(t, 0, base_atr, base_sup, base_vol, cfg.repeated_bar_rvol):
@@ -870,22 +887,22 @@ class Engine:
                             matched += 1
                             matched_rvol += v[t - j] / base_vol
                             first_offset = j
-                    if matched > 0:
+                    if matched >= cfg.minimum_evidence_bars:
                         mean_rvol = matched_rvol / matched
-                        top_e, bot_e = h[t], l[t]
-                        for j in range(0, first_offset + 1):
-                            top_e = max(top_e, h[t - j])
-                            bot_e = min(bot_e, l[t - j])
-                        if matched >= cfg.minimum_evidence_bars and mean_rvol >= cfg.repeated_mean_rvol \
-                                and (top_e - bot_e) <= cfg.max_base_width_atr * base_atr:
-                            repeated = True
-                            evidence_ratio = mean_rvol
-                            evidence_atr = base_atr
-                            observations = matched
-                            rule = "Repeated base-response proxy; pre-base volume reference"
+                        if mean_rvol >= cfg.repeated_mean_rvol:
+                            for j in range(0, first_offset + 1):
+                                evidence_top = max(evidence_top, h[t - j])
+                                evidence_bottom = min(evidence_bottom, l[t - j])
+                            if evidence_top - evidence_bottom <= cfg.max_base_width_atr * base_atr:
+                                repeated = True
+                                evidence_ratio = mean_rvol
+                                evidence_atr = base_atr
+                                evidence_start = t - first_offset
+                                observations = matched
+                                rule = "Repeated base-response proxy; pre-base volume reference"
                 if single or repeated:
-                    top_e = round_tick(h[t], tick)
-                    bot_e = round_tick(l[t], tick)
+                    top_e = round_tick(evidence_top, tick)
+                    bot_e = round_tick(evidence_bottom, tick)
                     width = top_e - bot_e
                     inv = floor_tick(bot_e - max(evidence_atr * cfg.invalidation_atr, cfg.invalidation_ticks * tick), tick)
                     valid = (width >= cfg.minimum_width_ticks * tick - eps
@@ -896,12 +913,13 @@ class Engine:
                         if old.active and shared >= cfg.duplicate_overlap:
                             duplicate = True
                         # do not recycle already-used observations into a new cluster
-                        if old.used and t <= old.known_bar \
+                        # (Pine: evidenceStart of the NEW cluster, oldest matched bar)
+                        if old.used and evidence_start <= old.known_bar \
                                 and t - old.known_bar <= cfg.evidence_window + cfg.origin_padding:
                             duplicate = True
                     if not duplicate and valid:
                         s = Setup(
-                            id=next_setup_id, start_bar=t, known_bar=t,
+                            id=next_setup_id, start_bar=evidence_start, known_bar=t,
                             top=top_e, bottom=bot_e, atr=evidence_atr,
                             invalidation=inv, rule=rule, evidence_rvol=evidence_ratio,
                             observations=observations,
@@ -1011,27 +1029,29 @@ class Engine:
                 if invalid:
                     z.source_state = -1
                     z.active = False
+                    z.armed = False  # f_retireZone
                     z.ended_bar = t
                     reason = "Source live-close stop condition" if c[t] < stop else "Source tap count exceeded maximum"
                     z.terminal_reason = reason
                     emit(K_ZONE_INVALID, t, zone_id=z.id, price=c[t],
                          reason=reason, close=c[t], stop=stop, taps=z.source_taps, state="OLD")
 
-                # eSSL tap on the FORMING bar only (confirmed bars handled in (B))
-                if not confirmed and cfg.ssl_enabled:
-                    for p in pools:
-                        if p.active and p.scope == 1 and t > p.born_bar:
-                            level = p.lower
-                            if l[t] <= level + cfg.essl_tap_buffer_ticks * tick + eps \
-                                    and t - p.born_bar <= cfg.essl_tap_max_age:
-                                pen = bool(l[t] <= level - cfg.ssl_penetration_ticks * tick + eps)
-                                emit(K_ESSL_TAP, t, pool_id=p.id, price=level,
-                                     low=l[t], close=c[t], penetrated=pen,
-                                     depth=max(level - l[t], 0.0) if pen else 0.0,
-                                     reclaimed=bool(c[t] >= level + cfg.ssl_reclaim_ticks * tick - eps),
-                                     members=p.members, age_bars=t - p.born_bar,
-                                     origin_date=dates[p.first_origin],
-                                     classification="LIVE tap (forming bar)")
+            # eSSL tap on the FORMING bar only (confirmed bars handled in (B)).
+            # Independent of zones: must run even when no zone is active.
+            if not confirmed and cfg.ssl_enabled:
+                for p in pools:
+                    if p.active and p.scope == 1 and t > p.born_bar:
+                        level = p.lower
+                        if l[t] <= level + cfg.essl_tap_buffer_ticks * tick + eps \
+                                and t - p.born_bar <= cfg.essl_tap_max_age:
+                            pen = bool(l[t] <= level - cfg.ssl_penetration_ticks * tick + eps)
+                            emit(K_ESSL_TAP, t, pool_id=p.id, price=level,
+                                 low=l[t], close=c[t], penetrated=pen,
+                                 depth=max(level - l[t], 0.0) if pen else 0.0,
+                                 reclaimed=bool(c[t] >= level + cfg.ssl_reclaim_ticks * tick - eps),
+                                 members=p.members, age_bars=t - p.born_bar,
+                                 origin_date=dates[p.first_origin],
+                                 classification="LIVE tap (forming bar)")
 
         counters.update({
             "footprints_observed": footprints_observed,

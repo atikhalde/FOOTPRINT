@@ -17,7 +17,6 @@ from fpfssl.config import EngineConfig
 from fpfssl.engine import (
     CLUSTERED,
     SWEEP,
-    TOUCHED,
     Engine,
     Event,
 )
@@ -26,7 +25,6 @@ from fpfssl.events import (
     K_ESSL_BREAK,
     K_ESSL_SWEEP,
     K_ESSL_TAP,
-    K_FRESH_ESSL,
     K_FOOTPRINT,
     K_SSL_CREATED,
     K_TAP,
@@ -46,7 +44,7 @@ def make_df(rows: list[tuple], start: str = "2024-01-01") -> pd.DataFrame:
     return df
 
 
-def run(rows: list[tuple], live_last: bool = False) -> "EngineResult":  # noqa: F821
+def run(rows: list[tuple], live_last: bool = False):
     cfg = EngineConfig()
     df = make_df(rows)
     return Engine("TEST", cfg, TICK).run(df, live_last_bar=live_last)
@@ -101,7 +99,6 @@ def test_full_chain():
     assert abs(fp.extra["bottom"] - 99.3) < 0.01, fp.extra
     assert fp.extra["reference"] > 100.0, fp.extra
     assert fp.extra["invalidation"] < 99.3, fp.extra
-    stop = fp.extra["invalidation"]
 
     # TAP 1 at bar 55 with first-tap adjustment
     taps = evs(res, K_TAP)
@@ -489,6 +486,36 @@ def test_provisional_forming_bar():
     print("ok test_provisional_forming_bar")
 
 
+# ---------------------------------------------------------------------------
+# Test 8: repeated (clustered) evidence — Pine widens the base to the union of
+# ALL intervening candles and moves evidenceStart to the OLDEST matched bar.
+# ---------------------------------------------------------------------------
+def test_repeated_evidence_union_and_start():
+    from fpfssl.config import DataConfig
+    from fpfssl.synthetic import generate
+
+    cfg = DataConfig(source="synthetic", history_bars=800)
+    seen = 0
+    for sym in ("AAA", "BBB", "CCC", "DDD", "EEE", "FFF"):
+        df = generate(sym, cfg)
+        h = df["high"].to_numpy(float)
+        l = df["low"].to_numpy(float)
+        res = Engine(sym, EngineConfig(), TICK).run(df, live_last_bar=False)
+        for s in res.setups:
+            if "Repeated" not in s.rule:
+                continue
+            seen += 1
+            # oldest matched bar is strictly before the bar that closed the cluster
+            assert s.start_bar < s.known_bar, (s.start_bar, s.known_bar)
+            assert s.start_bar >= s.known_bar - 4  # evidenceWindow = 5
+            # union semantics: base spans at least the current bar's extremes
+            assert s.top >= round(h[s.known_bar], 2) - 1e-9, (s.top, h[s.known_bar])
+            assert s.bottom <= round(l[s.known_bar], 2) + 1e-9, (s.bottom, l[s.known_bar])
+            assert s.top - s.bottom > 0
+    assert seen >= 3, f"expected repeated-evidence setups on synthetic data, saw {seen}"
+    print(f"ok test_repeated_evidence_union_and_start ({seen} repeated setups)")
+
+
 ALL = [
     test_full_chain,
     test_essl_pool_touch_and_sweep,
@@ -497,6 +524,7 @@ ALL = [
     test_synthetic_invariants,
     test_composite_all_rules,
     test_provisional_forming_bar,
+    test_repeated_evidence_union_and_start,
 ]
 
 

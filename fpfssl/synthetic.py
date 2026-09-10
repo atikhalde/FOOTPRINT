@@ -76,8 +76,11 @@ def generate(symbol: str, cfg: DataConfig, bars: int | None = None) -> pd.DataFr
         "open": opens, "high": highs, "low": lows, "close": closes, "volume": vol,
     }, index=idx)
     df.index.name = "date"
-    # round to 2 decimals like a stock
+    # round to 2 decimals like a stock, then re-enforce OHLC consistency
+    # (rounding can otherwise leave high < low or high < max(open, close))
     for col in ("open", "high", "low", "close"):
         df[col] = np.round(df[col], 2)
+    df["high"] = df[["open", "high", "low", "close"]].max(axis=1)
+    df["low"] = df[["open", "low", "close"]].min(axis=1)
     df["volume"] = df["volume"].astype(int)
     return df

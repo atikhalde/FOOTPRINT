@@ -85,7 +85,9 @@ def cmd_report(args):
             print(f"{sym}: {e}")
             continue
         tick = cfg.data.tick_overrides.get(sym, detect_tick(df))
-        live_last = cfg.data.source == "yahoo"
+        from datetime import datetime
+        live_last = (cfg.data.source == "yahoo"
+                     and df.index[-1].date() == datetime.now().date())
         res = Engine(sym, cfg.engine, tick).run(df, live_last_bar=live_last)
         st = summarize_state(res)
         last = df.index[-1].strftime("%Y-%m-%d")
