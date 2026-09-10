@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# project runtime artifacts (keep data out of git)
+state/
+output/
+data/*.csv
+!data/README.md
+
+# secrets
+.env
