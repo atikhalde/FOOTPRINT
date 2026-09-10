@@ -242,6 +242,7 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `armed eSSL: none` | no active eSSL level to tap (all breached/expired) |
 | both armed, far away | the setup is live but price has not reached the references yet |
 | `→ essl_ob_tap @ …` | the composite **is** firing on a recent bar — check the Telegram credentials |
+| `scan` exits: `Telegram is NOT configured` | a live run would drop everything, so it refuses to start (use `--dry-run` to preview) |
 
 The composite alert is deliberately strict (footprint TAP **and** eSSL tap on the
 *same* bar — the "ALL RULES" condition), so expect a *low* rate rather than a
@@ -304,7 +305,7 @@ them only after testing. Full list with descriptions: see the comment block in
 ```bash
 python tests/test_engine.py          # 9 indicator-parity scenarios (daily bars)
 python tests/test_fidelity_live.py   # 10 exact-match + live-NSE/intraday tests
-python tests/test_live_scanner.py    # 9 end-to-end live-scanner tests (offline feed)
+python tests/test_live_scanner.py    # 10 end-to-end live-scanner tests (offline feed)
 ```
 
 The first suite verifies the port bar-for-bar: the full

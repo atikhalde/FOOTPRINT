@@ -46,10 +46,14 @@ def cmd_scan(args):
         cfg.telegram.dry_run = False
     notifier = TelegramNotifier(cfg.telegram)
     if not notifier.cfg.dry_run and not notifier.ready:
-        print("Telegram is NOT configured (token/chat_id missing) — alerts would be "
-              "dropped.\nSet TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID or run with --dry-run.",
-              file=sys.stderr)
-    elif notifier.cfg.dry_run:
+        # fail fast: a live scanner that cannot deliver is worse than no scanner
+        print("Telegram is NOT configured (token/chat_id missing), so a live scan "
+              "would silently drop every alert.\nSet the TELEGRAM_BOT_TOKEN and "
+              "TELEGRAM_CHAT_ID environment variables (or telegram.token/chat_id in "
+              "config.yaml), or run with --dry-run / `diagnose` to inspect the "
+              "scanner without alerts.", file=sys.stderr)
+        sys.exit(2)
+    if notifier.cfg.dry_run:
         print("dry-run: Telegram messages will be printed, not sent.", file=sys.stderr)
     from .scanner import LiveScanner
     sc = LiveScanner(cfg, notifier)
