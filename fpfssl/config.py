@@ -175,6 +175,14 @@ class ScannerConfig:
     ])
     provisional_alerts: bool = True      # also alert on the still-forming bar (marked LIVE)
     alert_cooldown_minutes: float = 60.0
+    # TAP signal filters (apply to `essl_ob_tap` composite + `footprint_tap`).
+    # tap_first_only: only TAP 1/N on a zone alerts; TAP 2/3/4 stay silent.
+    # fresh_ob_only: only alert when the tapped OB itself is young
+    # (tap_bar - ob_born_bar <= fresh_ob_max_age_bars). An old zone tapped
+    # for the first time years later stays silent.
+    tap_first_only: bool = False
+    fresh_ob_only: bool = False
+    fresh_ob_max_age_bars: int = 50      # OB freshness window, in bars of data.interval
     min_bars: int = 300                  # skip symbols with too little history (engine warmup)
     max_stale_days: int = 4              # skip symbols whose last bar is older than this (trading-day aware)
     max_lag_minutes: int = 90            # intraday: skip when market is open but feed lags more than this
