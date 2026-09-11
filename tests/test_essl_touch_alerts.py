@@ -16,8 +16,10 @@ exactly match the indicator"*:
   7. a touch on the forming bar alerts LIVE and gets its confirmed follow-up
   8. engine: an old (non-fresh) level emits its tap on the forming bar and on
      the confirmed bar alike; `essl_tap_max_age` gates both paths identically
-  9. config.yaml and the dataclass defaults ship `essl_tap` (and the eSSL
-     reclaim family: `essl_sweep` + `essl_reclaim`) enabled
+  9. config.yaml and the dataclass defaults ship `essl_tap` enabled
+ 10. a bar that closes BELOW the level is a BREAK (the indicator retires the
+     level at that close): it never alerts as a touch — the FMGOETZE 445.65
+     "NOT reclaimed" alert cannot happen again
 
 Run:  .venv/bin/python tests/test_essl_touch_alerts.py     (or via pytest)
 """
@@ -321,10 +323,10 @@ def test_engine_taps_old_level_live_and_confirmed():
 # ---------------------------------------------------------------------------
 def test_shipped_config_enables_essl_tap():
     cfg = load_config(os.path.join(ROOT, "config.yaml"))
-    for ev in ("essl_tap", "essl_ob_tap", "footprint_tap", "essl_sweep", "essl_reclaim"):
-        assert ev in cfg.scanner.alert_events, cfg.scanner.alert_events
+    assert "essl_tap" in cfg.scanner.alert_events, cfg.scanner.alert_events
+    assert "essl_ob_tap" in cfg.scanner.alert_events, cfg.scanner.alert_events
+    assert "footprint_tap" in cfg.scanner.alert_events, cfg.scanner.alert_events
     assert "essl_tap" in AppConfig().scanner.alert_events
-    assert "essl_reclaim" in AppConfig().scanner.alert_events
     print(f"ok test_shipped_config_enables_essl_tap ({cfg.scanner.alert_events})")
 
 

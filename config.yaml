@@ -87,12 +87,10 @@ scanner:
                          #    with or without a footprint TAP that bar; NOT gated by the
                          #    TAP filters above, so a filtered composite still alerts its touch
     - footprint_tap      # source-compatible TAP #1 on a fresh FP-OB
-    # eSSL reclaim family — both fire, but ONLY a genuine reclaim FROM BELOW
-    # (prior close under the level, now back above) is labelled "RECLAIMED ✅".
-    # A wick SWEEP from above keeps its own "sweep" line (not a fresh reclaim).
-    - essl_sweep         # eSSL penetration + close reclaim FROM ABOVE (liquidity grab / sweep)
-    - essl_reclaim       # genuine reclaim FROM BELOW — the "RECLAIMED ✅" alert
     # muted — TAP #1 / fresh-OB focus (add back to the list to re-enable):
+    # - essl_sweep       # eSSL penetration + close reclaim (liquidity grab)
+    # - essl_break       # ⚠️ eSSL closed below — the level is retired (this is
+    #                    #    what a "NOT reclaimed" tap bar really is)
     # - defence          # source defence confirmed after a TAP
     # - zone_invalid     # OB invalidated (stop) or touch limit exceeded
     # - essl_created     # new eSSL reference published (fresh major low)
