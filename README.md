@@ -213,7 +213,11 @@ The **Actions** tab includes two workflows:
   delayed 5–30 min under load and high-frequency ticks get dropped (a 5-minute
   cron in this repo's history fired **once** where sixteen ticks were
   expected), so a design that needs 96 ticks a day cannot work; a design where
-  **any single tick covers the whole session** does. Add repository Actions
+  **any single tick covers the whole session** does. Every such job always ends
+  on its own: at the close, at its `--max-runtime-minutes 325` budget (under the
+  350-minute job timeout), or a second after you press **Cancel workflow** — see
+  [Stopping the scanner](#stopping-the-scanner-ctrl-c-cancel-runtime-budget).
+  Add repository Actions
   secrets `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for live alerts; scheduled
   runs pass `--no-dry-run`, so a `telegram.dry_run: true` left in `config.yaml`
   can never silently swallow alerts again. Manual runs send for real by default
@@ -235,6 +239,22 @@ the scanner job is long-lived instead of relying on a tick every 5 minutes. For
 guaranteed timing, run it under systemd below, or trigger the workflow from an
 external scheduler via `repository_dispatch`/`workflow_dispatch`. Synthetic
 results are demo data, not real market performance.
+
+## Stopping the scanner (Ctrl-C, cancel, runtime budget)
+
+`scan` (without `--once`) is a long-lived poller, so it has to be **stoppable**:
+
+| How | What happens |
+| --- | --- |
+| **Ctrl-C** / **SIGINT** | The poller stops within a second — at the next symbol, or immediately out of its poll nap — saves the dedup state and exits (`scanner stopped: received SIGINT`). |
+| **`kill <pid>`** / **SIGTERM** (systemd stop, `timeout`, CI cancel) | Same graceful stop, so a cancelled run never re-announces its alerts later. |
+| **`--max-runtime-minutes N`** (or `scanner.max_runtime_minutes`) | Hard wall-clock budget: after N minutes it saves state and exits cleanly, even mid-session. `0` (default) = the market clock alone decides. The Actions workflow passes `325`, below its own job timeout. |
+| **Actions → Cancel workflow** | Cancels within a second. It used to be swallowed: a backgrounded process inherits SIGINT as `SIG_IGN` from the runner's non-interactive shell, so Python never installed its `KeyboardInterrupt` handler and the job ran for hours. The scanner now **installs its own SIGINT/SIGTERM handlers**, which overrides the inherited disposition. |
+| **Pause the schedule** | Set the repository variable `SCANNER_ENABLED=false` (Settings → Secrets and variables → Actions → Variables). Scheduled ticks then exit immediately; manual *Run workflow* still works. |
+| **session end** | Unchanged: the poller exits `stop_after_close_minutes` (15) past the 15:30 IST close, after the closing bar settles. |
+
+A stopped run always leaves `state/scanner_state.json` written, so the pass that
+takes over (a queued cron tick, or your next `scan`) does not repeat alerts.
 
 ## Running it live on NSE (09:15–15:30 IST)
 

@@ -205,6 +205,12 @@ class ScannerConfig:
     # started further out it runs a single pass and exits (scheduled ticks are
     # cheap, holding a 6h runner for nothing is not).
     preopen_wait_minutes: float = 60.0
+    # Hard wall-clock budget for `scan` without --once: after this many minutes
+    # the poller saves its dedup state and exits cleanly, even if the session
+    # has not ended. 0 = no limit (the market clock alone decides). CI sets it
+    # below the job timeout so a long job always ends on its own instead of
+    # being killed mid-pass.
+    max_runtime_minutes: float = 0.0
 
 
 @dataclass
