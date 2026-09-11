@@ -11,12 +11,16 @@ lower-case columns: open, high, low, close, volume.
 from __future__ import annotations
 
 import io
+import logging
 import os
+import time
 from datetime import datetime, timedelta
 
 import pandas as pd
 
 from .config import DataConfig
+
+log = logging.getLogger("fpfssl.data")
 
 
 class DataError(RuntimeError):
@@ -101,7 +105,8 @@ def _yahoo_kwargs(cfg: DataConfig) -> dict:
             f"invalid interval {cfg.interval!r}: use one of "
             "1m,2m,5m,15m,30m,60m,90m,1h,1d,1wk,1mo"
         )
-    kw: dict = {"interval": interval, "auto_adjust": True, "prepost": bool(cfg.prepost)}
+    kw: dict = {"interval": interval, "auto_adjust": bool(cfg.auto_adjust),
+                "prepost": bool(cfg.prepost)}
     if interval in _INTRADAY_MAX_DAYS:
         # Intraday: Yahoo only serves a limited lookback. Prefer an explicit
         # period, else a recent start/end window, else the max allowed period.
@@ -126,11 +131,19 @@ def _yahoo_kwargs(cfg: DataConfig) -> dict:
         else:
             kw["period"] = f"{max_days}d"
     else:
-        kw["start"] = cfg.start or "2020-01-01"
-        if cfg.end:
-            kw["end"] = cfg.end
+        # Daily/weekly/monthly: full history by default. The Pine indicator's
+        # state machines run from the first bar of the chart, so parity with
+        # the indicator means the engine must see every bar the feed has —
+        # `max_bars` is the only cap. An explicit period/start/end wins.
         if cfg.period:
             kw["period"] = cfg.period
+        elif cfg.start or cfg.end:
+            if cfg.start:
+                kw["start"] = cfg.start
+            if cfg.end:
+                kw["end"] = cfg.end
+        else:
+            kw["period"] = "max"
     return kw
 
 
@@ -141,8 +154,9 @@ def load_yahoo(symbol: str, cfg: DataConfig) -> pd.DataFrame:
         raise DataError("yfinance is not installed (pip install yfinance)") from e
     kw = _yahoo_kwargs(cfg)
     try:
-        # auto_adjust=True: split/dividend-adjusted OHLC, so ATR/pivots see a
-        # continuous price series (unadjusted data injects fake gaps on ex-div dates)
+        # auto_adjust follows config: False (raw exchange OHLC) is the default
+        # because the Pine indicator runs on the exchange's unadjusted NSE
+        # prices — adjusted series would move every level the chart shows.
         df = yf.Ticker(symbol).history(**kw)
     except Exception as e:  # noqa: BLE001
         raise DataError(f"{symbol}: yahoo download failed ({e})") from e
@@ -153,7 +167,7 @@ def load_yahoo(symbol: str, cfg: DataConfig) -> pd.DataFrame:
         try:
             df = yf.Ticker(symbol).history(
                 period=f"{max_days}d", interval=kw["interval"],
-                auto_adjust=True, prepost=bool(cfg.prepost),
+                auto_adjust=kw["auto_adjust"], prepost=bool(cfg.prepost),
             )
         except Exception:  # noqa: BLE001
             pass
@@ -164,6 +178,108 @@ def load_yahoo(symbol: str, cfg: DataConfig) -> pd.DataFrame:
         except Exception:  # noqa: BLE001
             pass
     return _cap(df, cfg)
+
+
+def _split_download(raw: pd.DataFrame, group: list[str]) -> dict[str, pd.DataFrame]:
+    """Split a yf.download result into per-symbol frames.
+
+    yfinance 1.x returns a MultiIndex (Ticker, Price) by default; this helper
+    also copes with (Price, Ticker) orderings and single-symbol results.
+    """
+    if raw is None or len(raw) == 0:
+        return {}
+    frames: dict[str, pd.DataFrame] = {}
+    if isinstance(raw.columns, pd.MultiIndex):
+        wanted = {s.upper() for s in group}
+        ticker_level = raw.columns.nlevels - 1  # assume the LAST level
+        for lvl in range(raw.columns.nlevels):
+            vals = {str(v).upper() for v in raw.columns.get_level_values(lvl)}
+            if vals & wanted:
+                ticker_level = lvl
+                break
+        for tkr in group:
+            try:
+                sub = raw.xs(tkr, axis=1, level=ticker_level, drop_level=True)
+            except KeyError:
+                continue
+            if isinstance(sub, pd.Series):
+                sub = sub.to_frame()
+            frames[tkr] = sub.copy()
+    elif len(group) == 1:
+        frames[group[0]] = raw.copy()
+    else:
+        # un-levelled columns but several tickers requested: the first
+        # level-less column name is the ticker (older yfinance versions)
+        for tkr in group:
+            if tkr in raw.columns:
+                frames[tkr] = raw[[tkr]].copy()
+    return frames
+
+
+def load_yahoo_batch(symbols: list[str], cfg: DataConfig) -> dict[str, pd.DataFrame]:
+    """Fetch many symbols in one pass (full-universe scanner path).
+
+    yfinance makes one HTTP request per ticker even for bulk downloads, so a
+    full-NSE daily pass is ~2,000+ requests. This fetches them threaded, in
+    paced groups (`batch_size` / `batch_delay_sec`), and returns every symbol
+    that produced usable bars. Missing/dead tickers are simply absent (the
+    scanner logs them); DataError is only raised when NOTHING came back.
+    """
+    try:
+        import yfinance as yf
+    except ImportError as e:
+        raise DataError("yfinance is not installed (pip install yfinance)") from e
+    kw = _yahoo_kwargs(cfg)
+    size = max(1, int(getattr(cfg, "batch_size", 100) or 100))
+    threads = max(1, int(getattr(cfg, "batch_threads", 8) or 8))
+    delay = float(getattr(cfg, "batch_delay_sec", 0.5) or 0)
+    out: dict[str, pd.DataFrame] = {}
+    missing = 0
+    for i in range(0, len(symbols), size):
+        group = symbols[i:i + size]
+        try:
+            raw = yf.download(
+                group, group_by="ticker", threads=threads,
+                progress=False, **kw,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("batch download failed for %d symbols (%s)", len(group), e)
+            missing += len(group)
+            continue
+        got = 0
+        for tkr, sub in _split_download(raw, group).items():
+            try:
+                out[tkr] = _cap(_normalize(sub, tkr), cfg)
+                got += 1
+            except DataError as e:  # noqa: BLE001
+                log.info("%s: %s", tkr, e)
+        missing += len(group) - got
+        if delay and i + size < len(symbols):
+            time.sleep(delay)
+    if not out:
+        raise DataError(f"yahoo returned no usable bars for any of {len(symbols)} symbols")
+    if missing:
+        log.info("yahoo batch: %d/%d symbols returned data (%d missing/dead)",
+                 len(out), len(symbols), missing)
+    return out
+
+
+def load_all(symbols: list[str], cfg: DataConfig) -> dict[str, pd.DataFrame]:
+    """Load every symbol of a pass at once (best-effort).
+
+    * yahoo: one threaded batch call (fastest path for the full NSE universe).
+    * csv / synthetic: per-symbol load; failures are logged and skipped.
+    The result dict contains only symbols with usable bars.
+    """
+    if cfg.source == "yahoo":
+        return load_yahoo_batch(symbols, cfg)
+    out: dict[str, pd.DataFrame] = {}
+    for sym in symbols:
+        try:
+            out[sym] = load_symbol(sym, cfg)
+        except DataError as e:  # noqa: BLE001
+            log.warning("%s: %s", sym, e)
+    return out
 
 
 def load_csv(symbol: str, cfg: DataConfig) -> pd.DataFrame:

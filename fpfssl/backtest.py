@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from .config import BacktestConfig, DataConfig, EngineConfig
-from .data import load_symbol
+from .data import DataError, load_all, load_symbol
 from .engine import Engine, detect_tick
 from .events import K_ESSL_SWEEP, K_ESSL_TAP, K_TAP
 
@@ -101,12 +101,30 @@ def run_backtest(
         if cur is None or cur > need_start:
             fetch_cfg.start = need_start.strftime("%Y-%m-%d")
 
-    for sym in symbols:
+    # Full universe: one paced batch fetch, then per-symbol engine passes over
+    # the identical frames (same signals, one transport). Small/single lists
+    # and non-yahoo sources fall through to the per-symbol path.
+    frames: dict = {}
+    if fetch_cfg.source == "yahoo" and len(symbols) > 1 and fetch_cfg.batch:
         try:
-            df = load_symbol(sym, fetch_cfg)
-        except Exception as e:  # noqa: BLE001
-            print(f"  ! {sym}: data error: {e}")
-            continue
+            frames = load_all(symbols, fetch_cfg)
+            print(f"  fetched {len(frames)}/{len(symbols)} symbols in one batch")
+        except DataError as e:  # noqa: BLE001
+            print(f"  ! batch fetch failed ({e}); falling back to per-symbol")
+            frames = {}
+
+    for sym in symbols:
+        if frames:
+            df = frames.get(sym)
+            if df is None:
+                print(f"  ! {sym}: no data returned")
+                continue
+        else:
+            try:
+                df = load_symbol(sym, fetch_cfg)
+            except Exception as e:  # noqa: BLE001
+                print(f"  ! {sym}: data error: {e}")
+                continue
         n_ok += 1
         # `--bars` caps the backtest window (the data layer no longer truncates:
         # the live scanner needs every bar the feed serves).

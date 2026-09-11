@@ -3,6 +3,12 @@ name: Scanner
 # ---------------------------------------------------------------------------
 # Live NSE scanner (09:15-15:30 IST = 03:45-10:00 UTC, Mon-Fri).
 #
+# Default setup (config.yaml): DAILY timeframe (1d), the FULL NSE equity
+# universe (symbols: [full_nse], fetched via yfinance .NS tickers, list cached
+# in data/nse_universe.csv) and raw exchange prices so signals 1:1 match the
+# TradingView indicator. Each internal poll fetches the whole universe in one
+# paced batch, then runs the engine over every symbol.
+#
 # Reliability design: GitHub's `schedule` trigger is best-effort — ticks are
 # delayed by 5-30 min under load and high-frequency ticks are regularly
 # dropped (this repo's history: 1 scheduled tick out of ~16 expected). So the
@@ -125,7 +131,18 @@ jobs:
             echo ''
             echo '```text'
             # same feed/clock the scan used; --live marks the forming bar
-            python -m fpfssl diagnose 2>&1 | tail -n +2
+            args=(diagnose)
+            if [[ "${{ github.event_name }}" == "push" ]]; then
+              args+=(--source synthetic --symbols RELIANCE.NS --interval 15m)
+            else
+              if [[ -n "$SYMBOLS" ]]; then
+                args+=(--symbols "$SYMBOLS")
+              fi
+              if [[ -n "$INTERVAL" ]]; then
+                args+=(--interval "$INTERVAL")
+              fi
+            fi
+            python -m fpfssl "${args[@]}" 2>&1 | tail -n +2
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" || true
 

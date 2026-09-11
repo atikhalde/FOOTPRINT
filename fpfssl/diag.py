@@ -18,11 +18,12 @@ prints the table into the run summary so a silent session is explainable.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 
 from .config import AppConfig
-from .data import DataError, load_symbol
+from .data import DataError, load_all, load_symbol
 from .engine import Engine, detect_tick
 from .events import K_ESSL_TAP, K_TAP
 from .scanner import (
@@ -33,6 +34,8 @@ from .scanner import (
     timeframe_label,
     trading_days_between,
 )
+
+log = logging.getLogger("fpfssl.diag")
 
 
 @dataclass
@@ -298,7 +301,15 @@ def format_diag_many(diags: list[SymbolDiag], as_json: bool = False) -> str:
 def run_diag(cfg: AppConfig, symbols: list[str] | None = None,
              now: datetime | None = None, live: bool | None = None) -> list[SymbolDiag]:
     syms = symbols or list(cfg.symbols)
-    return [diag_symbol(s, cfg, now=now, live=live) for s in syms]
+    # batched fetch for the full universe (identical frames -> identical
+    # engine results as the per-symbol path; only the transport differs)
+    frames: dict = {}
+    if cfg.data.source == "yahoo" and len(syms) > 1 and cfg.data.batch:
+        try:
+            frames = load_all(syms, cfg.data)
+        except DataError as e:  # noqa: BLE001
+            log.warning("batch load failed (%s); falling back to per-symbol", e)
+    return [diag_symbol(s, cfg, df=frames.get(s), now=now, live=live) for s in syms]
 
 
 def session_window(cfg: AppConfig) -> tuple[str, str]:
