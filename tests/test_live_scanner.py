@@ -383,15 +383,194 @@ def test_run_forever_covers_the_session():
         _time.sleep = real_sleep
         _restore_scanner()
     assert passes["n"] > 20, f"too few passes over the session: {passes['n']}"
-    assert clock["t"].hour == 15 and clock["t"].minute >= 30, clock["t"]
+    # stopped at/after the close, and no later than one poll past it
+    stop_min = clock["t"].hour * 60 + clock["t"].minute
+    assert 15 * 60 + 30 <= stop_min <= 16 * 60 + 20, clock["t"]
     assert scanner._session_finished(cfg, clock["t"])
     print(f"ok test_run_forever_covers_the_session ({passes['n']} passes, "
           f"until {clock['t'].strftime('%H:%M')})")
 
 
+# ---------------------------------------------------------------------------
+# 9. Stopping the poller (ctrl-c / "Cancel workflow" / runtime budget)
+# ---------------------------------------------------------------------------
+def _poller_scanner(cfg, clock, passes):
+    """A LiveScanner whose clock is fake, sleeps are instant and passes count."""
+    import types
+
+    sc = scanner.LiveScanner.__new__(scanner.LiveScanner)
+    sc.cfg, sc.symbols = cfg, ["A.NS", "B.NS", "C.NS"]
+    sc.state = {"alerted": {}, "cooldown": {}}
+    sc.notifier = types.SimpleNamespace(send=lambda *a, **k: True)
+    sc.scan_once = lambda: (passes.__setitem__("n", passes["n"] + 1), 0)[1]
+    sc._save_state = lambda: None
+    scanner.market_now = lambda c: clock["t"]
+    return sc
+
+
+def test_stop_signal_interrupts_the_poll_nap():
+    """A stop request during the nap must end the loop — not wait 15 minutes.
+
+    Regression: the poller slept in one `time.sleep(nap)` call, so a cancel
+    only took effect when the nap happened to end.
+    """
+    import time as _time
+
+    cfg = AppConfig()
+    cfg.scanner.poll_minutes = 15
+    clock = {"t": datetime(2026, 9, 10, 10, 0)}      # market open
+    passes = {"n": 0}
+    sc = _poller_scanner(cfg, clock, passes)
+    real_sleep = _time.sleep
+    naps = {"n": 0}
+
+    def fake_sleep(sec):
+        naps["n"] += 1
+        clock["t"] += timedelta(seconds=min(sec, 600))
+        # stop the poller from inside the very first nap, like a signal would
+        if naps["n"] == 1:
+            sc.request_stop("received SIGINT")
+
+    try:
+        _time.sleep = fake_sleep
+        reason = sc.run_forever()
+    finally:
+        _time.sleep = real_sleep
+        _restore_scanner()
+    assert passes["n"] == 1, f"expected one pass then stop, got {passes['n']}"
+    assert "SIGINT" in reason, reason
+    assert clock["t"] < datetime(2026, 9, 10, 10, 16), f"kept polling after the stop: {clock['t']}"
+    print(f"ok test_stop_signal_interrupts_the_poll_nap (stopped after {naps['n']} sleep chunk(s): {reason})")
+
+
+def test_stop_signal_is_honoured_even_when_sigint_was_ignored():
+    """`install_stop_handlers` must override an inherited SIG_IGN.
+
+    Regression: a scanner started in the background by a non-interactive shell
+    (CI runner, `scan &`, nohup) inherits SIGINT set to SIG_IGN, and Python
+    then never installs its KeyboardInterrupt handler — Ctrl-C and GitHub's
+    "Cancel workflow" were silently swallowed and the job ran on for hours.
+    """
+    import signal
+
+    cfg = AppConfig()
+    clock = {"t": datetime(2026, 9, 10, 10, 0)}
+    passes = {"n": 0}
+    sc = _poller_scanner(cfg, clock, passes)
+    original = signal.getsignal(signal.SIGINT)
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)   # what a backgrounded job inherits
+        sc.install_stop_handlers()
+        assert signal.getsignal(signal.SIGINT) is not signal.SIG_IGN, \
+            "SIGINT is still ignored: cancel would be swallowed"
+        os.kill(os.getpid(), signal.SIGINT)            # deliver a real cancel
+        assert sc.stop_requested, "SIGINT did not reach the scanner"
+        assert "SIGINT" in sc.stop_reason, sc.stop_reason
+    finally:
+        sc.restore_stop_handlers()
+        signal.signal(signal.SIGINT, original)
+        _restore_scanner()
+    print("ok test_stop_signal_is_honoured_even_when_sigint_was_ignored")
+
+
+def test_max_runtime_minutes_stops_the_poller():
+    """`max_runtime_minutes` bounds a run so CI never has to kill it mid-pass."""
+    import time as _time
+
+    cfg = AppConfig()
+    cfg.scanner.poll_minutes = 15
+    cfg.scanner.max_runtime_minutes = 30               # 2 passes of nap
+    clock = {"t": datetime(2026, 9, 10, 10, 0)}
+    passes = {"n": 0}
+    sc = _poller_scanner(cfg, clock, passes)
+    real_sleep, real_monotonic = _time.sleep, _time.monotonic
+    tick = {"t": 0.0}
+
+    def fake_sleep(sec):
+        tick["t"] += sec                               # fake clock drives monotonic too
+        clock["t"] += timedelta(seconds=min(sec, 600))
+
+    try:
+        _time.sleep = fake_sleep
+        _time.monotonic = lambda: tick["t"]
+        reason = sc.run_forever()
+    finally:
+        _time.sleep = real_sleep
+        _time.monotonic = real_monotonic
+        _restore_scanner()
+    assert "runtime limit" in reason, reason
+    assert passes["n"] >= 1, "no pass ran before the budget check"
+    assert clock["t"] < datetime(2026, 9, 10, 11, 0), f"outlived its budget: {clock['t']}"
+    print(f"ok test_max_runtime_minutes_stops_the_poller ({passes['n']} pass(es), {reason})")
+
+
+def test_stop_saves_dedup_state():
+    """A cancelled run must persist its dedup state, or the next one re-announces."""
+    import json
+    import time as _time
+
+    tmp = tempfile.mkdtemp(prefix="fpfssl-stop-")
+    cfg = AppConfig()
+    cfg.symbols = []
+    cfg.data.source = "synthetic"
+    cfg.scanner.state_file = os.path.join(tmp, "state", "scanner_state.json")
+    clock = {"t": datetime(2026, 9, 10, 10, 0)}
+    scanner.market_now = lambda c: clock["t"]
+    sc = scanner.LiveScanner(cfg, Recorder())
+    self_stop = {"n": 0}
+    real_sleep = _time.sleep
+
+    def fake_sleep(sec):
+        self_stop["n"] += 1
+        clock["t"] += timedelta(seconds=min(sec, 600))
+        if self_stop["n"] == 1:
+            sc.request_stop("received SIGTERM")
+
+    try:
+        _time.sleep = fake_sleep
+        reason = sc.run_forever()
+    finally:
+        _time.sleep = real_sleep
+        _restore_scanner()
+    assert "SIGTERM" in reason, reason
+    with open(cfg.scanner.state_file, encoding="utf-8") as fh:
+        saved = json.load(fh)
+    assert set(saved) >= {"alerted", "cooldown"}, saved
+    print(f"ok test_stop_saves_dedup_state (state written to {cfg.scanner.state_file})")
+
+
+def test_scan_once_stops_between_symbols():
+    """A stop mid-pass must not finish a full-NSE scan (thousands of symbols)."""
+    cfg = AppConfig()
+    cfg.data.source = "synthetic"        # offline: no yahoo batch fetch
+    clock = {"t": datetime(2026, 9, 10, 10, 0)}
+    passes = {"n": 0}
+    sc = _poller_scanner(cfg, clock, passes)
+    scanned: list[str] = []
+
+    def fake_scan_symbol(sym, df=None):
+        scanned.append(sym)
+        sc.request_stop("received SIGTERM")   # a cancel lands mid-pass
+        return 0
+
+    sc.scan_symbol = fake_scan_symbol
+    del sc.scan_once                      # exercise the real scan_once loop
+    try:
+        sc.scan_once()
+    finally:
+        _restore_scanner()
+    assert scanned == ["A.NS"], f"kept scanning after a stop request: {scanned}"
+    print(f"ok test_scan_once_stops_between_symbols (stopped after {len(scanned)}/3 symbols)")
+
+
 ALL = [
     test_live_alert_long_lived_zone,
     test_run_forever_covers_the_session,
+    test_stop_signal_interrupts_the_poll_nap,
+    test_stop_signal_is_honoured_even_when_sigint_was_ignored,
+    test_max_runtime_minutes_stops_the_poller,
+    test_stop_saves_dedup_state,
+    test_scan_once_stops_between_symbols,
     test_live_alert_confirmed_after_bar_close,
     test_alert_dedup_across_passes,
     test_skips_stale_and_short_history,
