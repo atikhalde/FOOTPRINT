@@ -13,7 +13,13 @@ Flow per poll, per symbol:
      eSSL level — fresh or old, with or without a footprint TAP that bar, and
      never gated by tap_first_only / fresh_ob_only (those filter the footprint
      side only). A composite that the TAP filters reject therefore still
-     produces its eSSL touch alert.
+     produces its eSSL touch alert. "Active" is the indicator's own state: a
+     bar that penetrates the level ≥ 1 tick and closes back above it is a
+     sweep-and-reclaim (a valid tap), but a bar that closes BELOW the level
+     retires it at that close (first full penetration is terminal) — that
+     outcome goes to `essl_break`, never to the touch channel, and a forming
+     bar that is already below the level waits for the close instead of
+     alerting mid-break.
   4. dedupe against persisted state, apply cooldowns, format, send Telegram
 
 Dedup key: symbol | kind | bar-time | confirmed? | zone-or-pool-id
@@ -35,6 +41,7 @@ from .data import DataError, load_all, load_symbol
 from .engine import Engine, detect_tick
 from .events import (
     K_DEFENCE,
+    K_ESSL_BREAK,
     K_ESSL_SWEEP,
     K_ESSL_TAP,
     K_FOOTPRINT,
@@ -463,6 +470,7 @@ class LiveScanner:
                     K_DEFENCE: "defence",
                     K_ZONE_INVALID: "zone_invalid",
                     K_ESSL_SWEEP: "essl_sweep",
+                    K_ESSL_BREAK: "essl_break",
                     K_SSL_CREATED: "essl_created",
                     K_FOOTPRINT: "footprint_created",
                 }

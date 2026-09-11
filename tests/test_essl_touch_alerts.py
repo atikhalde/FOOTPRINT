@@ -1,10 +1,12 @@
 """eSSL LEVEL TOUCH alert tests (offline).
 
 Covers the request *"alert should also come when price touches the eSSL level
-(not fresh eSSL) — keep all others intact"*:
+(not fresh eSSL) — keep all others intact"* and the FMGOETZE 2026-09-10/11
+fix *"only the RECLAIMED touch is the correct eSSL level — the scanner must
+exactly match the indicator"*:
 
   1. price touches an eSSL level and NO footprint TAP fires that bar -> 💧 alert
-  2. the level does NOT have to be fresh — a 191-bar-old level still alerts
+  2. the level does NOT have to be fresh — a ~200-bar-old level still alerts
   3. a composite rejected by tap_first_only / fresh_ob_only still alerts its
      eSSL touch (it used to go silent together with the composite)
   4. when the composite DOES fire, the bare touch alert is not duplicated for
@@ -15,6 +17,9 @@ Covers the request *"alert should also come when price touches the eSSL level
   8. engine: an old (non-fresh) level emits its tap on the forming bar and on
      the confirmed bar alike; `essl_tap_max_age` gates both paths identically
   9. config.yaml and the dataclass defaults ship `essl_tap` enabled
+ 10. a bar that closes BELOW the level is a BREAK (the indicator retires the
+     level at that close): it never alerts as a touch — the FMGOETZE 445.65
+     "NOT reclaimed" alert cannot happen again
 
 Run:  .venv/bin/python tests/test_essl_touch_alerts.py     (or via pytest)
 """
@@ -31,7 +36,7 @@ import pandas as pd
 
 from fpfssl.config import AppConfig, DataConfig, EngineConfig, load_config
 from fpfssl.engine import Engine
-from fpfssl.events import K_ESSL_TAP, K_TAP
+from fpfssl.events import K_ESSL_BREAK, K_ESSL_TAP, K_TAP
 
 import fpfssl.scanner as scanner
 
@@ -43,12 +48,15 @@ SYM = "RELIANCE.NS"
 _ORIG_LOAD = scanner.load_symbol
 _ORIG_NOW = scanner.market_now
 
-# Fixture bars (see gen_intraday): bar 825 is the only composite bar and its
-# OB is 685 bars old, bar 86 touches one eSSL level, bar 84 touches two, and
-# bar 788 touches a level that is 191 bars old.
-BAR_TOUCH_ONLY = 86
-BAR_TWO_LEVELS = 84
-BAR_OLD_LEVEL = 788
+# Fixture bars (seed 40, see gen_intraday): bar 634 is the only composite bar
+# (footprint TAP + swept-and-RECLAIMED eSSL 264.8, OB 535 bars old), bar 302
+# touches one eSSL level, bar 790 touches two, bar 327 sweeps a level that is
+# 196 bars old, and bar 785 closes BELOW three eSSL levels — a break, which
+# must never alert as a touch.
+BAR_TOUCH_ONLY = 302
+BAR_TWO_LEVELS = 790
+BAR_OLD_LEVEL = 327
+BAR_BREAK = 785
 
 SHIPPED = ["essl_ob_tap", "essl_tap", "footprint_tap"]
 SHIPPED_FILTERS = dict(tap_first_only=True, fresh_ob_only=True,
@@ -322,6 +330,44 @@ def test_shipped_config_enables_essl_tap():
     print(f"ok test_shipped_config_enables_essl_tap ({cfg.scanner.alert_events})")
 
 
+# ---------------------------------------------------------------------------
+# 8b. THE FMGOETZE REGRESSION (2026-09-10): a bar that closes BELOW the level
+# terminally retires it in the indicator (first full penetration, no reclaim).
+# That bar is a BREAK — with the shipped config it must not reach the user as
+# a 💧 "price touched the eSSL level" alert. (Enable `essl_break` in
+# alert_events to get the honest ⚠️ break notice instead.)
+# ---------------------------------------------------------------------------
+def test_break_bar_never_alerts_a_touch():
+    df = gen_intraday()
+    evs = [e for e in engine_events(df) if e.kind == K_ESSL_BREAK and e.bar == BAR_BREAK]
+    assert evs, "fixture changed: bar no longer breaks an eSSL level"
+    assert all(e.extra.get("reclaimed") is False for e in evs)
+    taps = essl_touch_events(df, BAR_BREAK)
+    assert taps == [], "the engine tapped a bar that closed below the level"
+
+    # LIVE side: bar 785 still forming, provisional close below the levels —
+    # a mid-break bar waits for the close, nothing is sent
+    sc, rec, sent = scan_bar(df, BAR_BREAK)
+    assert not rec.touch_messages, rec.touch_messages
+    assert sent == 0, rec.messages
+
+    # confirmed side: bar 785 closed, then the next bar is forming. With the
+    # shipped config (essl_break muted) the user hears nothing at all; opting
+    # into `essl_break` reports the event honestly, as a ⚠️ BREAK — never as
+    # a 💧 touch.
+    cfg = mk_cfg(recent_bars=2, **SHIPPED_FILTERS)
+    _, rec_conf, _ = scan_bar(df, BAR_BREAK + 1, cfg)
+    assert not rec_conf.touch_messages, rec_conf.touch_messages
+    assert rec_conf.messages == [], rec_conf.messages
+    cfg_brk = mk_cfg(recent_bars=2, alert_events=["essl_break"], **SHIPPED_FILTERS)
+    _, rec_brk, _ = scan_bar(df, BAR_BREAK + 1, cfg_brk)
+    assert not rec_brk.touch_messages, rec_brk.touch_messages
+    assert any("eSSL BREAK" in m for m in rec_brk.messages), rec_brk.messages
+    assert not any("touched the eSSL level" in m for m in rec_brk.messages)
+    print(f"ok test_break_bar_never_alerts_a_touch "
+          f"({len(evs)} level(s) broken on bar {BAR_BREAK}, 0 touch alerts)")
+
+
 ALL = [
     test_touch_without_footprint_tap_alerts,
     test_old_essl_level_touch_alerts,
@@ -332,6 +378,7 @@ ALL = [
     test_touch_alert_live_then_confirmed,
     test_engine_taps_old_level_live_and_confirmed,
     test_shipped_config_enables_essl_tap,
+    test_break_bar_never_alerts_a_touch,
 ]
 
 
