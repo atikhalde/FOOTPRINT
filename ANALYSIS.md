@@ -320,7 +320,11 @@ Everything above is ported 1:1 (verified by the hand-crafted scenario suite in
 
 1. **eSSL tap events** — the source has *no alerts*. The port emits `essl_tap`
    (touch / partial / full penetration, with the script's own penetration & reclaim
-   definitions), `essl_sweep`, and `essl_break` so the scanner can alert.
+   definitions), `essl_sweep`, and `essl_break` so the scanner can alert. An
+   `essl_tap` fires for **every** touch of **every** active external level — fresh
+   or old, first visit or repeat, on the forming bar and on confirmed bars alike.
+   The only age rule is `essl_tap_max_age`, applied identically on both paths
+   (default 250 = `ssl_max_age`, i.e. every live level counts).
 2. **The composite ALL-RULES signal** (`essl_ob_tap`): on one bar, an active
    eSSL level is tapped **and** a confirmed FP-OB's source-TAP condition fires —
    i.e. *price taps the eSSL level with all the remaining rules matched*. This is the
@@ -398,12 +402,21 @@ zone is 685 bars old — it fails against the trimmed implementation.
   and 10–15 sweeps. `diagnose` prints this rate per symbol; measure your own
   universe with `backtest --strategy essl_ob_tap` instead of expecting a daily
   stream.
+* The 💧 **eSSL level-touch alert** (`essl_tap`) is the price-only half of that
+  condition and ships **enabled**: price reaching an active eSSL level alerts on
+  its own — no footprint TAP required, no freshness requirement, and never gated
+  by `tap_first_only` / `fresh_ob_only`. A composite the TAP filters reject still
+  produces its touch alert (the message names the filter that dropped the
+  footprint side); the one level a *sent* composite already reported is not
+  repeated. This is what makes a silent session impossible while price is sitting
+  on an eSSL level.
 * The forming last bar goes through section (G) (TAP) and the group-8
   forming-bar eSSL pass, so a LIVE alert can be sent mid-bar; the closed bar
   has a distinct dedupe key (and is normally suppressed by the cooldown).
 * Dedupe key = `symbol | interval | event | bar-time | confirmed? | zone/pool`.
   Cooldown = per `symbol+event`, so distinct signals of the same kind inside the
-  window collapse into one message.
+  window collapse into one message — **except** `essl_tap`, whose cooldown is per
+  `symbol+event+level` so two eSSL levels touched on the same bar both alert.
 
 ### 10.3 Scheduling reality
 

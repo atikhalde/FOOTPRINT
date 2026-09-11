@@ -64,6 +64,8 @@ jobs:
           python tests/test_engine.py
           python tests/test_fidelity_live.py
           python tests/test_live_scanner.py
+          python tests/test_tap_filters.py
+          python tests/test_essl_touch_alerts.py
       - name: Run backtest
         shell: bash
         run: |

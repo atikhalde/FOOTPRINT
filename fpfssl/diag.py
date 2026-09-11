@@ -78,6 +78,7 @@ class SymbolDiag:
     zones_active: int = 0
     essl_active: int = 0
     composites: int = 0          # composite bars found in the fetched window
+    essl_touch_bars: int = 0     # bars where price touched an eSSL level (💧 essl_tap)
     last_composite: str = ""
     bars_since_composite: int = -1
     watches: list[Watch] = field(default_factory=list)
@@ -207,6 +208,8 @@ def diag_symbol(
     comp_bars = [i for i, d in enumerate(res.dates)
                  if K_TAP in per_bar.get(d, ()) and K_ESSL_TAP in per_bar.get(d, ())]
     out.composites = len(comp_bars)
+    # 💧 essl_tap rate: every bar where price reached an active eSSL level
+    out.essl_touch_bars = sum(1 for k in per_bar.values() if K_ESSL_TAP in k)
     if comp_bars:
         out.last_composite = res.dates[comp_bars[-1]]
         out.bars_since_composite = len(df) - 1 - comp_bars[-1]
@@ -220,14 +223,20 @@ def diag_symbol(
             "zone_id": e.zone_id, "pool_id": e.pool_id,
         })
 
-    # Would the composite fire right now?
+    # Would an alert fire right now? (the composite AND the eSSL level touch)
+    want = set(cfg.scanner.alert_events or [])
     by_bar: dict[str, set] = {}
     for e in res.events:
         if e.bar >= cutoff:
             by_bar.setdefault(e.date, set()).add(e.kind)
     for date, kinds in sorted(by_bar.items()):
-        if K_TAP in kinds and K_ESSL_TAP in kinds:
+        comp = K_TAP in kinds and K_ESSL_TAP in kinds
+        if comp:
             out.would_alert.append(f"essl_ob_tap @ {date}")
+        if K_ESSL_TAP in kinds and "essl_tap" in want:
+            note = " — level already inside the composite above" if comp else ""
+            out.would_alert.append(
+                f"essl_tap @ {date} (price touched an eSSL level{note})")
     if not out.would_alert:
         taps = [w for w in out.watches if w.kind == "fp_ob"]
         essl = [w for w in out.watches if w.kind == "essl"]
@@ -240,7 +249,8 @@ def diag_symbol(
         else:
             out.would_alert.append(
                 "waiting: price must reach an FP-OB reference AND an eSSL level "
-                "on the same bar (nearest: %s %.2f / %s %.2f)"
+                "on the same bar for the composite — or just an eSSL level for "
+                "the 💧 essl_tap alert (nearest: %s %.2f / %s %.2f)"
                 % (taps[0].kind, taps[0].level, essl[0].kind, essl[0].level))
     return out
 
@@ -270,6 +280,7 @@ def format_diag(d: SymbolDiag) -> str:
             f"({d.composites / d.bars * 100:.2f}%)")
     if d.last_composite:
         rate += f"; last {d.last_composite} ({d.bars_since_composite} bars ago)"
+    rate += f" | 💧 eSSL level touched on {d.essl_touch_bars} bar(s)"
     lines.append(f"   alert rate: {rate}")
     if d.watches:
         lines.append("   live references (closest first):")

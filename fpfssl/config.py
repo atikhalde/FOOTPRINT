@@ -104,6 +104,10 @@ class EngineConfig:
     # -- 8 - Scanner alert extension (NOT in the Pine script) ---------------
     # eSSL tap semantics for the live scanner / backtest signals:
     essl_tap_buffer_ticks: int = 0      # extra ticks of "in front of" the level that still count as a tap
+    # Only age limit on an eSSL tap, applied identically on the forming bar and
+    # on confirmed bars. 250 == ssl_max_age, so with the defaults EVERY active
+    # eSSL level alerts when touched — fresh or old. Lower it only if you want
+    # to ignore levels that have been sitting there a long time.
     essl_tap_max_age: int = 250         # ignore eSSL pools older than this (bars)
 
     def validate(self) -> None:
@@ -167,6 +171,7 @@ class ScannerConfig:
     state_file: str = "state/scanner_state.json"
     alert_events: list[str] = field(default_factory=lambda: [
         "essl_ob_tap",    # composite: eSSL tap on a bar where a footprint TAP also fires (ALL RULES)
+        "essl_tap",       # price TOUCHED an active eSSL level (fresh or old; no footprint TAP needed)
         "essl_sweep",     # confirmed eSSL sweep / gap reclaim (liquidity grab + reclaim)
         "footprint_tap",  # source-compatible TAP on any confirmed FP-OB
         "defence",        # source defence confirmation after a TAP
@@ -180,6 +185,9 @@ class ScannerConfig:
     # fresh_ob_only: only alert when the tapped OB itself is young
     # (tap_bar - ob_born_bar <= fresh_ob_max_age_bars). An old zone tapped
     # for the first time years later stays silent.
+    # NB: neither filter touches `essl_tap` — an eSSL LEVEL touch alerts on
+    # every touch of every active level, fresh or old. A composite rejected by
+    # these filters still produces its eSSL touch alert.
     tap_first_only: bool = False
     fresh_ob_only: bool = False
     fresh_ob_max_age_bars: int = 50      # OB freshness window, in bars of data.interval

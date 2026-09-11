@@ -152,10 +152,14 @@ def format_event(symbol: str, tf: str, ev: Event) -> str:
         parts.append(f"   entry ref {_p(e.get('reference'))} → TAP armed when price returns to it")
         return "\n".join(parts)
     if ev.kind == K_ESSL_TAP:
-        title = "eSSL TAP — price tapped external sell-side liquidity"
-        head = _head(symbol, tf, ev, title, "💧")
+        head = _head(symbol, tf, ev, "eSSL TAP — price touched the eSSL level", "💧")
         parts = [head, _essl_line(ev)]
-        parts.append("   (standalone eSSL tap — no footprint TAP on this bar)")
+        if e.get("tap_filtered"):
+            parts.append("   ℹ️ a footprint TAP fired on this bar but was filtered "
+                         f"({e['tap_filtered']}) — eSSL touch alert only")
+        else:
+            parts.append("   ℹ️ eSSL level touch — fires on every touch of an active "
+                         "eSSL level (fresh or old, no footprint TAP required)")
         return "\n".join(parts)
     if ev.kind == K_ESSL_SWEEP:
         head = _head(symbol, tf, ev, "eSSL SWEEP + RECLAIM — liquidity grabbed at external low", "🌀")
