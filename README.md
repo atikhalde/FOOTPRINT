@@ -4,7 +4,8 @@ A bar-for-bar Python port of the Pine v6 indicator
 **"Footprint Source TAP + Fresh SSL + Developing Preview v8.2"**
 (`FOOTPRINT ESSL.txt`), running on the **live Indian market (NSE/BSE) via yfinance**:
 
-* a **live market scanner** over the **FULL NSE equity universe** (default: **daily TF**)
+* a **live market scanner** over the **FULL NSE equity universe** (default: **daily TF**,
+  narrowed by the **size filters** — market cap > ₹1,000 Cr and price > ₹100)
   that sends **Telegram alerts** whenever, in *any* watched stock, price **taps an eSSL
   level with all the remaining rules matched** (a confirmed footprint OB's source-TAP
   condition fires on the same bar), **and** — enabled by default — whenever price simply
@@ -40,11 +41,14 @@ export TELEGRAM_BOT_TOKEN="123456:ABC-..."      # or set in config.yaml
 export TELEGRAM_CHAT_ID="123456789"
 python -m fpfssl test-telegram                  # must print a message ✅
 
-# 3. Live NSE scanner (default: DAILY bars, FULL NSE universe, 15-min polling)
-python -m fpfssl scan                           # runs the session (Ctrl-C to stop)
+# 3. Live NSE scanner (default: DAILY bars, FULL NSE universe, size filters)
+python -m fpfssl scan                           # one pass over the universe, then exits
+python -m fpfssl scan --keep-polling            # poll every 15 min until the close instead
 python -m fpfssl scan --once                    # single pass, then exit
 python -m fpfssl scan --once --dry-run          # print what would be sent
 python -m fpfssl scan --symbols RELIANCE.NS,TCS.NS   # subset instead of full_nse
+python -m fpfssl scan --once --dry-run --min-mcap-cr 20000 --min-price 500
+python -m fpfssl scan --once --dry-run --no-size-filters   # scan the whole NSE
 
 # 4. Backtest the alert signals (default strategy: essl_ob_tap)
 python -m fpfssl backtest                       # daily, full NSE universe
@@ -212,6 +216,46 @@ restore the unfiltered stream. The default `alert_events` list is
 `essl_ob_tap` + `essl_tap` + `footprint_tap` — add the muted events back to
 re-enable them.
 
+### Size filters — market cap > ₹1,000 Cr and price > ₹100
+
+The universe is the whole NSE, but most of it is not worth an alert: ₹40
+penny stocks on a few-crore float produce exactly the same signals and mostly
+produce untradeable ones. `config.yaml` therefore ships with two **size
+filters**, applied per symbol *after* its bars are loaded and *before* the
+engine runs (so a filtered stock costs no engine time at all):
+
+```yaml
+scanner:
+  min_market_cap_cr: 1000   # ₹ crore — keep only stocks worth MORE than 1,000 Cr
+  min_price: 100            # ₹     — keep only stocks trading ABOVE ₹100
+  keep_unknown_market_cap: true   # no share count available -> scan anyway
+  market_cap_cr_overrides: {}     # pin a symbol's ₹ crore, e.g. {TATASTEEL.NS: 95000}
+```
+
+Both thresholds are **strictly greater than** (₹1,000.00 exactly is filtered
+out), and `0` switches that filter off. The 💧 `essl_tap` alert is *not*
+exempt here — a filtered symbol is not scanned at all, so nothing alerts on it.
+
+* **Price** is the last close of the frame the pass already fetched — raw
+  exchange ₹, free, no extra request.
+* **Market cap** = `shares outstanding × last close`, recomputed **every pass**,
+  so a stock that sinks below the floor drops out of the scan and comes back the
+  moment it recovers. Share counts move ~quarterly, so they are fetched once and
+  cached in `data/nse_fundamentals.csv` (like the symbol list;
+  `data.fundamentals_max_age_days: 30`). The first full-NSE pass pays the
+  metadata fetch, every later pass is free.
+* Symbols that clear the filters carry a size footer in their alerts, so a
+  message states what it is worth:
+  `📏 size price ₹1,432.00 · mcap ₹945,000 Cr · filter: mcap > ₹1,000 Cr + price > ₹100.00`
+* **Fail-open:** if no share count can be resolved (metadata endpoint down), the
+  symbol is *kept* and the pass logs one warning. A metadata outage must never
+  silently swallow alerts; set `keep_unknown_market_cap: false` to make the
+  filter strict instead.
+* Try it without editing config: `scan --once --dry-run --min-mcap-cr 20000
+  --min-price 500`, or scan everything again with `--no-size-filters`.
+  `diagnose` reports the same verdict per symbol (`⛔ FILTERED OUT (size
+  filters) — market cap ₹54 Cr below the ₹1,000 Cr minimum`).
+
 ---
 
 ## GitHub Actions: Scanner and Backtest
@@ -220,7 +264,9 @@ The **Actions** tab includes two workflows:
 
 * **Scanner** — scheduled every 10 minutes across the NSE session
   (09:15–15:30 IST = 03:45–10:00 UTC, Mon–Fri). **Each trigger starts one job
-  that polls internally until the close** (`python -m fpfssl scan`), and the
+  that scans the universe once and exits** (`python -m fpfssl scan` with the
+  shipped `scanner.exit_after_pass: true`; dispatch with `poll_session: true`
+  to get the previous session-long poller back), and the
   `concurrency` group keeps a single scanner alive: a tick that fires while a
   session job is running becomes the next queued run and takes over when the
   job ends. That matters because GitHub's `schedule` is best-effort — ticks are
@@ -254,14 +300,20 @@ guaranteed timing, run it under systemd below, or trigger the workflow from an
 external scheduler via `repository_dispatch`/`workflow_dispatch`. Synthetic
 results are demo data, not real market performance.
 
-## Stopping the scanner (Ctrl-C, cancel, runtime budget)
+## Stopping the scanner (one pass, Ctrl-C, cancel, runtime budget)
 
-`scan` (without `--once`) is a long-lived poller, so it has to be **stoppable**:
+`scan` (without `--once`) can be a long-lived poller, so it has to be
+**stoppable** — and by default it no longer needs to be: `scanner.exit_after_pass:
+true` makes a run do ONE complete pass over the universe, save its dedup state and
+exit (`scanner stopped: scan complete (scanner.exit_after_pass)`). Set it to
+`false` (or pass `--keep-polling`) for the session-long poller described below:
 
 | How | What happens |
 | --- | --- |
 | **Ctrl-C** / **SIGINT** | The poller stops within a second — at the next symbol, or immediately out of its poll nap — saves the dedup state and exits (`scanner stopped: received SIGINT`). |
 | **`kill <pid>`** / **SIGTERM** (systemd stop, `timeout`, CI cancel) | Same graceful stop, so a cancelled run never re-announces its alerts later. |
+| **one pass then exit** (`scanner.exit_after_pass: true`, the shipped default) | The pass completes, dedup state is saved, the process exits. A scheduled CI run therefore ends with its scan instead of sitting in the runner until the close (with every later cron tick queued behind it in the `concurrency` group). |
+| **`--max-pass-minutes N`** (or `scanner.max_pass_minutes`) | Ceiling for a *single* pass (default `90`): a yahoo batch fetch that stalls past the ceiling is abandoned in a daemon thread — logged, state saved, run ends. This is the fix for "the scanner is stuck": a hung `yfinance` request used to be able to hold the pass (and the CI job) open indefinitely, because the polling loop only checked the clock *between* passes. |
 | **`--max-runtime-minutes N`** (or `scanner.max_runtime_minutes`) | Hard wall-clock budget: after N minutes it saves state and exits cleanly, even mid-session. `0` (default) = the market clock alone decides. The Actions workflow passes `325`, below its own job timeout. |
 | **Actions → Cancel workflow** | Cancels within a second. It used to be swallowed: a backgrounded process inherits SIGINT as `SIG_IGN` from the runner's non-interactive shell, so Python never installed its `KeyboardInterrupt` handler and the job ran for hours. The scanner now **installs its own SIGINT/SIGTERM handlers**, which overrides the inherited disposition. |
 | **Pause the schedule** | Set the repository variable `SCANNER_ENABLED=false` (Settings → Secrets and variables → Actions → Variables). Scheduled ticks then exit immediately; manual *Run workflow* still works. |
@@ -368,6 +420,7 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `⛔ SKIPPED — stale feed …` | the last bar is `max_stale_days` trading days old (wrong symbol/timezone, feed stuck) |
 | `⛔ SKIPPED — feed lag …` | the market is open but the feed is `max_lag_minutes` behind |
 | `⛔ SKIPPED — only N bars < min_bars` | not enough history to warm the engine up |
+| `⛔ FILTERED OUT (size filters) — …` | the symbol is below `min_market_cap_cr` / `min_price` and is **not scanned at all** (raise the thresholds or set them to `0` to see it again) |
 | `⏳ newest bar … is from a previous session` | pre-open/holiday: nothing new to alert yet (warm-up pass) |
 | `armed FP-OBs: none` | no confirmed footprint OB — the composite needs a TAP, so nothing can fire (the 💧 eSSL touch alert does **not** need one) |
 | `armed eSSL: none` | no active eSSL level to tap (all breached/expired) — neither the composite nor the 💧 touch alert can fire |
@@ -445,6 +498,8 @@ python tests/test_fidelity_live.py      # 10 exact-match + live-NSE/intraday tes
 python tests/test_live_scanner.py       # 10 end-to-end live-scanner tests (offline feed)
 python tests/test_tap_filters.py        # 5 TAP #1 / fresh-OB filter tests
 python tests/test_essl_touch_alerts.py  # 10 eSSL level-touch alert tests
+python tests/test_universe.py           # full-NSE universe + batched-download tests
+python tests/test_size_filters.py       # 15 size-filter / stop-after-pass tests
 ```
 
 The first suite verifies the port bar-for-bar: the full
@@ -467,6 +522,13 @@ filters still alerts its touch, a level the composite already reported is not
 duplicated, two levels on one bar both alert, muting `essl_tap` still silences
 it, and the engine taps an old level on the forming bar and the confirmed bar
 alike under one `essl_tap_max_age` rule.
+The sixth pins the **size filters** (price floor skips before the engine, market-cap
+floor both ways with ₹1,000 Cr exactly filtered, fail-open vs fail-closed on an
+unknown share count, `market_cap_cr_overrides`, the 📏 alert footer), the
+share-count cache (round-trip, only-missing `prime()`, age-based refresh,
+market cap = shares × price in ₹ crore) and the run mode: `exit_after_pass` ends
+after one pass while the polling mode still naps between passes, and a stalled
+feed is abandoned at `max_pass_minutes` instead of hanging the run.
 
 ## Project layout
 
@@ -477,7 +539,8 @@ config.yaml             universe + scanner/backtest/telegram/engine config (NSE 
 fpfssl/
   engine.py             1:1 port of the Pine state machines (+ eSSL event layer)
   events.py             event model + Telegram message formatting
-  scanner.py            live polling scanner (IST clock, any TF), dedupe, alert dispatch
+  scanner.py            live polling scanner (IST clock, any TF), size filters, dedupe, alerts
+  fundamentals.py        share counts / market cap for the size filters (cached)
   diag.py               `diagnose`: armed references / why-no-alert, per symbol
   backtest.py           signal trading + statistics + CSV reports
   data.py               yahoo (daily/intraday) / csv / synthetic loaders
@@ -487,6 +550,7 @@ fpfssl/
 tests/test_engine.py        indicator-parity scenario tests
 tests/test_fidelity_live.py exact-match + live-NSE/intraday tests
 tests/test_live_scanner.py  offline end-to-end live-scanner (fake feed/clock) tests
+tests/test_size_filters.py  size filters (₹ crore / ₹ floors) + run-mode/ceiling tests
 data/                   CSV data (git-ignored); `sample-data` fills it synthetically
 state/                  scanner dedupe state (git-ignored)
 output/                 backtest reports (git-ignored)

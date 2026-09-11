@@ -24,3 +24,10 @@ python -m fpfssl sample-data --bars 1200
 python -m fpfssl backtest --source csv
 python -m fpfssl scan --once --source csv --dry-run
 ```
+
+Two scanner caches also live here (git-ignored, and cached between CI runs by
+the Scanner workflow): `nse_universe.csv` (full-NSE symbol list,
+`data.universe_max_age_days`) and `nse_fundamentals.csv` (share counts behind
+`scanner.min_market_cap_cr`, `data.fundamentals_max_age_days`). Delete either
+to force a refresh, or re-run with `--refresh-universe` /
+`--refresh-fundamentals`.

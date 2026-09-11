@@ -159,6 +159,11 @@ class DataConfig:
     universe_cache_file: str = "data/nse_universe.csv"
     universe_max_age_days: float = 7.0   # reuse the cached symbol list this long
     tick_overrides: dict[str, float] = field(default_factory=dict)  # symbol -> tick size
+    # share counts for the scanner's market-cap size filter (see fpfssl/fundamentals.py).
+    # A share count changes ~quarterly, so it is cached like the symbol list and
+    # market cap is recomputed as shares x last close on every pass.
+    fundamentals_cache_file: str = "data/nse_fundamentals.csv"
+    fundamentals_max_age_days: float = 30.0
 
     def is_intraday(self) -> bool:
         # yfinance: 1m = 1 minute (intraday), 1mo = 1 month (not intraday)
@@ -194,6 +199,22 @@ class ScannerConfig:
     min_bars: int = 300                  # skip symbols with too little history (engine warmup)
     max_stale_days: int = 4              # skip symbols whose last bar is older than this (trading-day aware)
     max_lag_minutes: int = 90            # intraday: skip when market is open but feed lags more than this
+    # -- size filters (universe hygiene: skip names too small to be tradeable) --
+    # Applied per symbol AFTER the bars are loaded and BEFORE the engine runs, so
+    # a filtered name costs no engine time. Both are strictly-greater-than:
+    #   min_market_cap_cr: keep a symbol only if shares x last close > this (₹ crore)
+    #   min_price:         keep a symbol only if its last close > this (₹)
+    # 0 disables that filter (so a config written before these existed behaves
+    # exactly as before). Market cap comes from the cached share count
+    # (fpfssl/fundamentals.py) — see `data.fundamentals_cache_file`.
+    min_market_cap_cr: float = 0.0
+    min_price: float = 0.0
+    # When no share count can be resolved for a symbol: true = scan it anyway
+    # (a metadata outage must not silently swallow alerts), false = skip it.
+    keep_unknown_market_cap: bool = True
+    # Pin/override a symbol's market cap in ₹ crore (offline runs, or to keep a
+    # name in the scan even though the feed reports no share count).
+    market_cap_cr_overrides: dict[str, float] = field(default_factory=dict)
     market_timezone: str = "Asia/Kolkata"  # NSE/BSE live clock (IST)
     market_open: str = "09:15"           # NSE equity session open (IST, HH:MM)
     market_close: str = "15:30"          # NSE equity session close (IST, HH:MM)
@@ -211,6 +232,16 @@ class ScannerConfig:
     # below the job timeout so a long job always ends on its own instead of
     # being killed mid-pass.
     max_runtime_minutes: float = 0.0
+    # exit_after_pass: `scan` without --once stops after ONE complete pass
+    # instead of napping until the close. Without it a scheduled run holds the
+    # runner for the rest of the session (~6h) and every later cron tick queues
+    # behind it, which reads as "the scanner is stuck". true = one pass, save
+    # the dedup state, exit; let the next tick (or a new run) do the next pass.
+    exit_after_pass: bool = False
+    # Ceiling for a single pass (batch fetch + engine loop). The batched yahoo
+    # fetch waits on this and abandons a stalled download instead of hanging
+    # forever; the per-symbol loop stops at the next symbol boundary. 0 = off.
+    max_pass_minutes: float = 0.0
 
 
 @dataclass

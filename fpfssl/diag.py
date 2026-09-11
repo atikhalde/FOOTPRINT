@@ -24,6 +24,7 @@ from datetime import datetime
 
 from .config import AppConfig
 from .data import DataError, load_all, load_symbol
+from .fundamentals import FundamentalTable, SizeFilters
 from .engine import Engine, detect_tick
 from .events import K_ESSL_TAP, K_TAP
 from .scanner import (
@@ -69,6 +70,7 @@ class SymbolDiag:
     first_bar: str = ""
     last_bar: str = ""
     last_close: float = 0.0
+    market_cap_cr: float = 0.0     # ₹ crore (0.0 = no share count cached)
     tick: float = 0.0
     live_last_bar: bool = False
     market_open: bool = False
@@ -134,6 +136,8 @@ def diag_symbol(
     df=None,
     now: datetime | None = None,
     live: bool | None = None,
+    filters: SizeFilters | None = None,
+    fundamentals: FundamentalTable | None = None,
 ) -> SymbolDiag:
     """Run the same engine pass the scanner runs and explain the state."""
     tf = timeframe_label(cfg.data.interval)
@@ -152,6 +156,8 @@ def diag_symbol(
     out.last_bar = str(df.index[-1])
     out.last_close = float(df["close"].iloc[-1])
     out.market_open = market_is_open(cfg, now)
+    flt = filters or SizeFilters.from_config(cfg.scanner)
+    out.market_cap_cr = flt.market_cap_cr(sym, out.last_close, fundamentals) or 0.0
     if cfg.data.source == "yahoo":
         out.stale_trading_days = trading_days_between(df.index[-1], now)
         if out.market_open and cfg.data.is_intraday():
@@ -182,6 +188,16 @@ def diag_symbol(
         out.status = "skipped"
         out.skip_reason = (f"only {len(df)} bars < min_bars={cfg.scanner.min_bars} "
                            "(engine warmup)")
+    # size filters — the same check scan_symbol applies before it runs the
+    # engine, so this report explains "why is RELIANCE not in my alerts" and
+    # "why is this penny stock not scanned at all" the same way. A filtered
+    # symbol stops here: no engine, no watches, just the verdict.
+    if out.status == "ok" and flt.enabled:
+        keep, why = flt.check(sym, out.last_close, fundamentals)
+        if not keep:
+            out.status = "filtered"
+            out.skip_reason = why
+            return out
 
     tick = cfg.data.tick_overrides.get(sym, detect_tick(df, sym))
     out.tick = tick
@@ -258,7 +274,8 @@ def diag_symbol(
 def format_diag(d: SymbolDiag) -> str:
     lines: list[str] = []
     head = (f"{d.symbol} [{d.tf}] {d.bars} bars {d.first_bar} → {d.last_bar} "
-            f"close {d.last_close:,.2f} tick {d.tick:g}")
+            f"close {d.last_close:,.2f} tick {d.tick:g}"
+            + (f" | mcap ₹{d.market_cap_cr:,.0f} Cr" if d.market_cap_cr else ""))
     lines.append(head)
     state = ("market OPEN" if d.market_open else "market closed")
     lines.append(f"   {state} | last bar {'FORMING (LIVE)' if d.live_last_bar else 'closed'}"
@@ -266,6 +283,12 @@ def format_diag(d: SymbolDiag) -> str:
                  + (f" | stale {d.stale_trading_days} trading days" if d.stale_trading_days else ""))
     if d.status == "stale-session":
         lines.append(f"   ⏳ {d.skip_reason}")
+        return "\n".join(lines)
+    if d.status == "filtered":
+        lines.append(f"   ⛔ FILTERED OUT (size filters) — {d.skip_reason}")
+        return "\n".join(lines)
+    if d.status == "capped":
+        lines.append(f"   ⏳ NOT DIAGNOSED — {d.skip_reason}")
         return "\n".join(lines)
     if d.status != "ok":
         lines.append(f"   ⛔ SKIPPED — {d.skip_reason}")
@@ -310,7 +333,21 @@ def format_diag_many(diags: list[SymbolDiag], as_json: bool = False) -> str:
 
 
 def run_diag(cfg: AppConfig, symbols: list[str] | None = None,
-             now: datetime | None = None, live: bool | None = None) -> list[SymbolDiag]:
+             now: datetime | None = None, live: bool | None = None,
+             refresh_fundamentals: bool = False,
+             max_symbols: int = 0) -> list[SymbolDiag]:
+    """Diagnose every symbol of the (filtered) universe.
+
+    The size filters are resolved here once — including a share-count fetch for
+    whatever the cache cannot answer — so each `diag_symbol` is pure CPU, and
+    the report shows exactly what the scanner will (not) scan.
+
+    `max_symbols` bounds the *engine* work, which is the slow serial part: the
+    symbols that pass the size filters are ranked biggest-first (market cap,
+    else price) and only the top N get a full state dump — those are exactly the
+    names the scanner can alert on. Everything else is still listed with its
+    verdict (a filtered symbol returns before the engine, so it is free).
+    """
     syms = symbols or list(cfg.symbols)
     # batched fetch for the full universe (identical frames -> identical
     # engine results as the per-symbol path; only the transport differs)
@@ -320,7 +357,55 @@ def run_diag(cfg: AppConfig, symbols: list[str] | None = None,
             frames = load_all(syms, cfg.data)
         except DataError as e:  # noqa: BLE001
             log.warning("batch load failed (%s); falling back to per-symbol", e)
-    return [diag_symbol(s, cfg, df=frames.get(s), now=now, live=live) for s in syms]
+    flt = SizeFilters.from_config(cfg.scanner)
+    table = FundamentalTable(
+        cache_file=getattr(cfg.data, "fundamentals_cache_file", "") or "",
+        max_age_days=float(getattr(cfg.data, "fundamentals_max_age_days", 30.0) or 0),
+    ).load()
+    if flt.mcap_on and cfg.data.source == "yahoo":
+        cands = [s for s in syms
+                 if s in frames and (flt.min_price <= 0
+                                     or float(frames[s]["close"].iloc[-1]) > flt.min_price)]
+        try:
+            table.prime(cands, refresh=refresh_fundamentals, fail_open=flt.fail_open,
+                        cfg=cfg)
+        except Exception as e:  # noqa: BLE001 - never let metadata break a report
+            log.warning("share-count fetch failed (%s) — failing open", e)
+
+    def _price(s: str) -> float:
+        df = frames.get(s)
+        return float(df["close"].iloc[-1]) if df is not None and len(df) else 0.0
+
+    order, tail = list(syms), []
+    cap = int(max_symbols or 0)
+    if cap > 0 and len(syms) > cap:
+        if frames:
+            # rank the symbols the scanner would actually keep, biggest first —
+            # those are the ones worth an engine pass; the rest only ever need a
+            # verdict line. Without a batched frame there is no price to rank on
+            # (csv/synthetic feeds), so the list order decides instead.
+            def _rank(s: str) -> tuple:
+                px = _price(s)
+                return (-(flt.market_cap_cr(s, px, table) or 0.0), -px)
+            kept = [s for s in syms if flt.check(s, _price(s), table)[0]]
+            rest = [s for s in syms if s not in set(kept)]
+            order = sorted(kept, key=_rank)[:cap] + sorted(kept, key=_rank)[cap:] + rest
+            log.info("diagnose: engine work capped to the %d biggest symbols that pass "
+                     "the size filters (of %d kept, %d total)", min(cap, len(kept)),
+                     len(kept), len(syms))
+        else:
+            order, tail = syms[:cap], syms[cap:]
+            log.info("diagnose: engine work capped to the first %d of %d symbols", cap, len(syms))
+    diags = [diag_symbol(s, cfg, df=frames.get(s), now=now, live=live,
+                         filters=flt, fundamentals=table) for s in order]
+    for s in tail:
+        d = SymbolDiag(symbol=s, interval=cfg.data.interval,
+                       tf=timeframe_label(cfg.data.interval))
+        d.status = "capped"
+        d.skip_reason = (f"engine work capped by --max-symbols {cap} — bars never "
+                         f"loaded for this symbol (nothing was inferred from that)")
+        diags.append(d)
+    return diags
 
 
 def session_window(cfg: AppConfig) -> tuple[str, str]:
