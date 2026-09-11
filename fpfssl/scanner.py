@@ -13,7 +13,13 @@ Flow per poll, per symbol:
      eSSL level — fresh or old, with or without a footprint TAP that bar, and
      never gated by tap_first_only / fresh_ob_only (those filter the footprint
      side only). A composite that the TAP filters reject therefore still
-     produces its eSSL touch alert.
+     produces its eSSL touch alert. "Active" is the indicator's own state: a
+     bar that penetrates the level ≥ 1 tick and closes back above it is a
+     sweep-and-reclaim (a valid tap), but a bar that closes BELOW the level
+     retires it at that close (first full penetration is terminal) — that
+     outcome goes to `essl_break`, never to the touch channel, and a forming
+     bar that is already below the level waits for the close instead of
+     alerting mid-break.
   4. dedupe against persisted state, apply cooldowns, format, send Telegram
 
 Dedup key: symbol | kind | bar-time | confirmed? | zone-or-pool-id
@@ -25,6 +31,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import signal
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -236,7 +244,116 @@ class LiveScanner:
         self.notifier = notifier
         self.symbols = symbols or list(cfg.symbols)
         self.state: dict = {"alerted": {}, "cooldown": {}}
+        self._init_runtime()
         self._load_state()
+
+    # -- cancellation / runtime budget ----------------------------------------
+    def _init_runtime(self) -> None:
+        """Create the stop flag, handler bookkeeping and runtime deadline.
+
+        Idempotent: tests build a scanner with ``__new__`` (no ``__init__``),
+        and `run_forever` calls this again so a stop request always has an
+        Event to set even on such an instance.
+        """
+        if getattr(self, "_stop", None) is None:
+            self._stop = threading.Event()
+        if getattr(self, "_stop_reason", None) is None:
+            self._stop_reason = ""
+        if getattr(self, "_saved_handlers", None) is None:
+            self._saved_handlers: dict[int, object] = {}
+        if not hasattr(self, "_runtime_deadline"):
+            self._runtime_deadline = self._compute_deadline()
+
+    def _compute_deadline(self) -> float | None:
+        """monotonic() deadline from `scanner.max_runtime_minutes` (None = none)."""
+        minutes = float(getattr(self.cfg.scanner, "max_runtime_minutes", 0) or 0)
+        return time.monotonic() + minutes * 60.0 if minutes > 0 else None
+
+    @property
+    def stop_requested(self) -> bool:
+        """True once Ctrl-C / SIGTERM (or `request_stop`) asked us to stop."""
+        self._init_runtime()
+        return self._stop.is_set()
+
+    @property
+    def stop_reason(self) -> str:
+        self._init_runtime()
+        return self._stop_reason
+
+    def request_stop(self, reason: str = "stop requested") -> None:
+        """Ask the scanner to stop at the next checkpoint (thread-safe)."""
+        self._init_runtime()
+        if not self._stop.is_set():
+            self._stop_reason = reason
+            self._stop.set()
+
+    def _handle_stop_signal(self, signum, _frame) -> None:
+        try:
+            name = signal.Signals(signum).name
+        except Exception:  # noqa: BLE001
+            name = str(signum)
+        self.request_stop(f"received {name}")
+
+    def install_stop_handlers(self) -> None:
+        """Make SIGINT/SIGTERM stop the loop — even when they were ignored.
+
+        A process started in the background by a non-interactive shell (CI
+        runners, `... &`, nohup, systemd) inherits SIGINT set to SIG_IGN, and
+        Python then never installs its KeyboardInterrupt handler: Ctrl-C /
+        "Cancel workflow" are silently swallowed and the scanner only stops
+        when the job is killed. Installing the handler explicitly overrides the
+        inherited disposition, so a stop request is always honoured.
+        """
+        self._init_runtime()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._saved_handlers[sig] = signal.signal(sig, self._handle_stop_signal)
+            except (ValueError, OSError, AttributeError):  # not the main thread
+                log.debug("could not install a handler for signal %s", sig)
+
+    def restore_stop_handlers(self) -> None:
+        for sig, handler in list(getattr(self, "_saved_handlers", {}).items()):
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError, TypeError):  # noqa: BLE001
+                pass
+        self._saved_handlers = {}
+
+    def out_of_time(self) -> bool:
+        """True once the `max_runtime_minutes` budget is spent."""
+        self._init_runtime()
+        deadline = self._runtime_deadline
+        return deadline is not None and time.monotonic() >= deadline
+
+    def _stop_now(self) -> str:
+        """Reason to stop right now — "" while the poller may keep going."""
+        if self.stop_requested:
+            return self.stop_reason or "stop requested"
+        if self.out_of_time():
+            return "runtime limit reached"
+        return ""
+
+    def _sleep(self, seconds: float) -> bool:
+        """Sleep in short chunks so a stop request wakes us within a second.
+
+        Returns True when the full nap elapsed, False when it was cut short by
+        a stop request. Chunking (instead of one long `time.sleep`) is what
+        makes "cancel" feel instant during the 15-minute poll nap; the elapsed
+        total is accumulated from the chunks (not from the wall clock) so a
+        patched/faked `time.sleep` in tests stays in control of the clock.
+        """
+        self._init_runtime()
+        seconds = max(0.0, float(seconds))
+        slept = 0.0
+        while slept < seconds:
+            # wake for a stop request *and* for an expired runtime budget:
+            # otherwise a cancel would have to wait out the whole nap
+            if self._stop.is_set() or self.out_of_time():
+                return False
+            chunk = min(1.0, seconds - slept)
+            time.sleep(chunk)
+            slept += chunk
+        return not (self._stop.is_set() or self.out_of_time())
 
     # -- state ---------------------------------------------------------------
     def _load_state(self):
@@ -501,7 +618,15 @@ class LiveScanner:
             log.info("fetched %d/%d symbols in %.1fs",
                      len(frames), len(self.symbols), time.time() - t0)
         missing = 0
+        done = 0
+        stopped = ""
         for sym in self.symbols:
+            # A stop request (or an expired budget) must not wait for the rest
+            # of a full-NSE pass (thousands of symbols): bail out at the next
+            # symbol boundary.
+            stopped = self._stop_now()
+            if stopped:
+                break
             try:
                 if frames:
                     df = frames.get(sym)
@@ -513,8 +638,12 @@ class LiveScanner:
                     total += self.scan_symbol(sym)
             except Exception as e:  # noqa: BLE001
                 log.exception("symbol %s failed: %s", sym, e)
+            done += 1
         if missing:
             log.info("%d symbol(s) returned no bars and were skipped", missing)
+        if stopped:
+            log.info("pass stopped early (%s): %d/%d symbols scanned", stopped,
+                     done, len(self.symbols))
         if not self.cfg.telegram.dry_run:
             self._save_state()
         tf = timeframe_label(self.cfg.data.interval)
@@ -522,8 +651,8 @@ class LiveScanner:
                  time.time() - t0, total, len(self.symbols), tf)
         return total
 
-    def run_forever(self):
-        """Poll until the session ends.
+    def run_forever(self) -> str:
+        """Poll until the session ends (or the run is stopped).
 
         Designed for a single scheduled trigger that has to cover the whole
         NSE session (09:15-15:30 IST): GitHub's cron is best-effort and drops
@@ -533,8 +662,21 @@ class LiveScanner:
         * started before the open   -> waits for the open, then polls
         * started during the session -> polls immediately
         * started after the close   -> one final pass, then exits
+
+        Stops (saving dedup state) on any of:
+        * the session ending (`stop_after_close_minutes` past the close);
+        * SIGINT / SIGTERM — Ctrl-C or a cancelled CI job. Handlers are
+          installed explicitly because a backgrounded process inherits SIGINT
+          as SIG_IGN, which would otherwise swallow every cancel request;
+        * `scanner.max_runtime_minutes` (0 = unlimited), so a long CI job
+          always ends by itself instead of being killed mid-pass.
+
+        Returns the reason it stopped.
         """
         poll = max(1.0, self.cfg.scanner.poll_minutes)
+        self._init_runtime()
+        self._runtime_deadline = self._compute_deadline()
+        self.install_stop_handlers()
         tf = timeframe_label(self.cfg.data.interval)
         now = market_now(self.cfg)
         log.info("starting live scanner: %d symbols [%s], poll every %.1f min, "
@@ -545,37 +687,62 @@ class LiveScanner:
         # pre-open: wait for the bell instead of hammering the feed — but only
         # when the open is close. A run started hours early does one pass and
         # exits so it does not hold the runner (a later tick starts the session).
-        if not market_is_open(self.cfg, now):
-            wait_min = minutes_until_open(self.cfg, now)
-            if wait_min is None or wait_min > self.cfg.scanner.preopen_wait_minutes:
-                log.info("market closed (%s; next open in %s min) — single pass, then exit",
-                         now.strftime("%a %H:%M"),
-                         "?" if wait_min is None else f"{wait_min:.0f}")
-                self.scan_once()
-                self._save_state()
-                return
-            if wait_min > 0:
-                log.info("market closed now (%s) — waiting %.0f min for the open",
-                         now.strftime("%a %H:%M"), wait_min)
-                deadline = now + timedelta(minutes=wait_min)
-                while market_now(self.cfg) < deadline:
-                    time.sleep(min(60.0, max(1.0, wait_min * 60.0)))
-        while True:
+        reason = "session finished"
+        try:
+            if not market_is_open(self.cfg, now):
+                wait_min = minutes_until_open(self.cfg, now)
+                if wait_min is None or wait_min > self.cfg.scanner.preopen_wait_minutes:
+                    log.info("market closed (%s; next open in %s min) — single pass, then exit",
+                             now.strftime("%a %H:%M"),
+                             "?" if wait_min is None else f"{wait_min:.0f}")
+                    self.scan_once()
+                    return "finished single pass (market closed)"
+                if wait_min > 0:
+                    log.info("market closed now (%s) — waiting %.0f min for the open "
+                             "(ctrl-c / cancel stops the wait)",
+                             now.strftime("%a %H:%M"), wait_min)
+                    deadline = now + timedelta(minutes=wait_min)
+                    while market_now(self.cfg) < deadline:
+                        if not self._sleep(min(60.0, max(1.0, wait_min * 60.0))):
+                            reason = self._stop_now() or "stop requested"
+                            log.info("stopped waiting for the open (%s)", reason)
+                            return reason
+            while True:
+                try:
+                    self.scan_once()
+                except Exception as e:  # noqa: BLE001
+                    log.exception("scan pass failed: %s", e)
+                stopped = self._stop_now()
+                if stopped:
+                    reason = stopped
+                    if reason == "runtime limit reached":
+                        log.info("%s — scanner exiting (dedup state saved; the next "
+                                 "run picks the session back up)", reason)
+                    break
+                now = market_now(self.cfg)
+                if _session_finished(self.cfg, now):
+                    reason = "session finished"
+                    log.info("session finished (%s) — scanner exiting",
+                             now.strftime("%a %H:%M"))
+                    break
+                # fixed cadence, but never oversleep the close; inside the
+                # settle window after the close keep the same cadence (the
+                # sleep is chunked so a stop request wakes us immediately)
+                until_close = minutes_until_close(self.cfg, now)
+                if until_close <= 0:
+                    nap = poll * 60.0
+                else:
+                    nap = min(poll * 60.0, max(30.0, until_close * 60.0))
+                if not self._sleep(nap):
+                    reason = self._stop_now() or "stop requested"
+                    break
+        finally:
+            self.restore_stop_handlers()
+            # never lose the dedup state on the way out: without it the next
+            # pass would re-announce every alert of this run
             try:
-                self.scan_once()
-            except Exception as e:  # noqa: BLE001
-                log.exception("scan pass failed: %s", e)
-            now = market_now(self.cfg)
-            if _session_finished(self.cfg, now):
-                log.info("session finished (%s) — scanner exiting",
-                         now.strftime("%a %H:%M"))
                 self._save_state()
-                return
-            # fixed cadence, but never oversleep the close; inside the settle
-            # window after the close keep the same cadence (no busy loop)
-            until_close = minutes_until_close(self.cfg, now)
-            if until_close <= 0:
-                nap = poll * 60.0
-            else:
-                nap = min(poll * 60.0, max(30.0, until_close * 60.0))
-            time.sleep(nap)
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not save scanner state: %s", e)
+            log.info("scanner stopped (%s)", reason)
+        return reason

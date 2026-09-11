@@ -62,6 +62,8 @@ def cmd_scan(args):
         # explicit production intent: never let a stale config value swallow alerts
         cfg.telegram.dry_run = False
     notifier = TelegramNotifier(cfg.telegram)
+    if args.max_runtime_minutes is not None:
+        cfg.scanner.max_runtime_minutes = args.max_runtime_minutes
     if not notifier.cfg.dry_run and not notifier.ready:
         # fail fast: a live scanner that cannot deliver is worse than no scanner
         print("Telegram is NOT configured (token/chat_id missing), so a live scan "
@@ -76,8 +78,15 @@ def cmd_scan(args):
     sc = LiveScanner(cfg, notifier)
     if args.once:
         sc.scan_once()
-    else:
-        sc.run_forever()
+        return
+    try:
+        reason = sc.run_forever()
+    except KeyboardInterrupt:
+        # signal handlers are installed inside run_forever, so this only
+        # catches an interrupt that landed before they were in place
+        sc.request_stop("interrupted")
+        reason = "interrupted"
+    print(f"scanner stopped: {reason}")
 
 
 def cmd_backtest(args):
@@ -259,6 +268,9 @@ def main(argv=None):
     s.add_argument("--dry-run", action="store_true", help="print Telegram messages instead of sending")
     s.add_argument("--no-dry-run", dest="no_dry_run", action="store_true",
                    help="force real Telegram sends even if telegram.dry_run is true in config")
+    s.add_argument("--max-runtime-minutes", type=float, metavar="MIN",
+                   help="stop polling after this many minutes even if the session is "
+                        "still open (0 = no limit; CI sets it below the job timeout)")
     s.set_defaults(fn=cmd_scan)
 
     b = sub.add_parser("backtest", help="backtest the alert signals")

@@ -664,7 +664,16 @@ class Engine:
                                          members=p.members, age_bars=age_bars,
                                          origin_date=dates[p.first_origin],
                                          classification=SSL_STATE_NAMES[final])
-                            if p.scope == 1 and l[t] <= p.lower + eps \
+                            # Group-8 tap: only a bar that HELD the level — the
+                            # script's own reclaim condition. When the close
+                            # ends below (CLOSED_BELOW / NO_RECLAIM /
+                            # GAP_THROUGH) the first full penetration is
+                            # TERMINAL: the level stops being an active eSSL at
+                            # this very close, so it is no longer a touchable
+                            # level when the alert's bar ends. That outcome is
+                            # carried by K_ESSL_BREAK above, never by a touch.
+                            if p.scope == 1 and reclaimed \
+                                    and l[t] <= p.lower + eps \
                                     and t - p.born_bar <= cfg.essl_tap_max_age:
                                 emit(K_ESSL_TAP, t, pool_id=p.id, price=p.lower,
                                      low=l[t], close=c[t], penetrated=True,
@@ -738,6 +747,7 @@ class Engine:
                         if inside and not math.isnan(prior_atr[t]) and prior_atr[t] > 0:
                             register_ssl(t, 0, price, origin, prior_atr[t])
                         ssl_last_minor_obs = origin
+                # Explicit bounded ownership, not forward-removal from the traversed list.
                 while len(pools) > cfg.ssl_record_cap:
                     idx = 0
                     for i, p in enumerate(pools):
@@ -1100,6 +1110,10 @@ class Engine:
             # independent of freshness: any ACTIVE external level inside
             # `essl_tap_max_age` (default 250 = the pool's own expiry, so in
             # practice every live level) counts, exactly like the (B) path.
+            # A bar that is ALREADY >= 1 tick below the level with the
+            # provisional close not back above is mid-break, not a touch: it
+            # stays silent and waits for the close — a reclaim then alerts via
+            # the confirmed sweep tap, a close below is a break (never a tap).
             if not confirmed and cfg.ssl_enabled:
                 for p in pools:
                     if p.active and p.scope == 1 and t > p.born_bar:
@@ -1107,10 +1121,13 @@ class Engine:
                         if l[t] <= level + cfg.essl_tap_buffer_ticks * tick + eps \
                                 and t - p.born_bar <= cfg.essl_tap_max_age:
                             pen = bool(l[t] <= level - cfg.ssl_penetration_ticks * tick + eps)
+                            rec = bool(c[t] >= level + cfg.ssl_reclaim_ticks * tick - eps)
+                            if pen and not rec:
+                                continue
                             emit(K_ESSL_TAP, t, pool_id=p.id, price=level,
                                  low=l[t], close=c[t], penetrated=pen,
                                  depth=max(level - l[t], 0.0) if pen else 0.0,
-                                 reclaimed=bool(c[t] >= level + cfg.ssl_reclaim_ticks * tick - eps),
+                                 reclaimed=rec,
                                  members=p.members, age_bars=t - p.born_bar,
                                  origin_date=dates[p.first_origin],
                                  classification="LIVE tap (forming bar)")

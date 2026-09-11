@@ -18,6 +18,19 @@ name: Scanner
 # a session job is running simply becomes the next queued run and takes over
 # when that job ends. Any single tick that fires near/inside the session now
 # covers the whole session.
+#
+# Stopping it (all three were broken / missing before):
+#   1. "Cancel workflow" in the Actions UI — the scanner installs its own
+#      SIGINT/SIGTERM handlers, so it stops within a second, saves its dedup
+#      state and exits. (It used to inherit SIGINT as SIG_IGN from the runner's
+#      non-interactive shell, so cancel was silently swallowed for hours.)
+#   2. It always ends on its own: at the close (15:30 IST + 15 min settle) or
+#      at its `--max-runtime-minutes` budget — below the job's timeout, so the
+#      runner never has to kill a pass.
+#   3. Pause the schedule without touching this file: set the repository
+#      variable SCANNER_ENABLED=false (Settings → Secrets and variables →
+#      Actions → Variables). Scheduled ticks then exit immediately; manual
+#      `workflow_dispatch` runs still work.
 # ---------------------------------------------------------------------------
 on:
   push:
@@ -59,6 +72,9 @@ concurrency:
 
 jobs:
   scan:
+    # SCANNER_ENABLED=false pauses the 10-minute schedule (see header) without
+    # deleting the cron or blocking a manual dispatch.
+    if: github.event_name != 'schedule' || vars.SCANNER_ENABLED != 'false'
     runs-on: ubuntu-latest
     # hard cap below GitHub's 6h job limit: the poller exits at the close, and
     # a queued tick takes over if this job is cut off near the end of the day
@@ -111,6 +127,11 @@ jobs:
             exit 1
           else
             args+=(--no-dry-run)   # config.yaml telegram.dry_run cannot silence CI
+            # Wall-clock budget: the poller saves its dedup state and exits on
+            # its own well before the job's timeout-minutes, so the runner
+            # never has to kill a half-finished pass. The next queued tick
+            # (cron fires every 10 min) picks the session back up.
+            args+=(--max-runtime-minutes 325)
           fi
           if [[ "${{ github.event_name }}" == "push" ]]; then
             args+=(--source synthetic --symbols RELIANCE.NS --interval 15m)
@@ -122,10 +143,16 @@ jobs:
               args+=(--interval "$INTERVAL")
             fi
           fi
-          python -m fpfssl "${args[@]}"
+          # Hard backstop under `timeout-minutes`: if the poller ever cannot
+          # exit by itself, SIGTERM (handled: saves state, exits) and then
+          # SIGKILL 5 minutes later. Nothing can run forever.
+          timeout --signal=TERM --kill-after=5m 335m python -m fpfssl "${args[@]}"
 
       - name: Why (no) alert? — live state per symbol
-        if: always()
+        # `always()` but NOT after a cancel: this step re-fetches the whole
+        # universe, and nobody wants a cancelled job to keep the runner busy
+        # for another full-universe pass.
+        if: always() && !cancelled()
         shell: bash
         run: |
           {

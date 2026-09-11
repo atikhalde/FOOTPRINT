@@ -54,6 +54,12 @@ scanner:
   min_bars: 600          # skip symbols with less history (ATR/MA/pivot/SSL/pool warmup)
   stop_after_close_minutes: 15   # keep polling this long past 15:30 IST for the closing bar
   preopen_wait_minutes: 60       # started earlier than this before the open -> single pass, exit
+  # Hard wall-clock budget for `scan` (no --once): after this many minutes the
+  # poller saves its dedup state and exits cleanly even mid-session, so a long
+  # CI job always ends by itself instead of being killed mid-pass (a queued
+  # cron tick takes over). 0 = unlimited (the market clock alone decides) —
+  # the Actions workflow passes --max-runtime-minutes 325 explicitly.
+  max_runtime_minutes: 0         # 0 = no limit; CI sets 325 (under its 350-min job timeout)
   max_stale_days: 4      # skip symbols whose last bar is older than this many TRADING days (weekends OK)
   max_lag_minutes: 90    # intraday: skip when market is open but the feed lags more than this
   market_timezone: Asia/Kolkata  # live NSE clock (IST)
@@ -70,6 +76,11 @@ scanner:
   # Which events produce Telegram messages. essl_ob_tap is the composite:
   #   price TAPPED an eSSL level on a bar where a footprint-source TAP also
   #   fired = "price at eSSL level with ALL the remaining rules matched".
+  # eSSL taps are touches of a level that is STILL ACTIVE when the bar ends —
+  # exactly the levels the indicator draws. A bar that closes back above after
+  # tapping (sweep + reclaim) is a valid tap; a bar that closes BELOW the level
+  # retires it in the indicator (first full penetration is terminal) and is
+  # reported — if at all — as essl_break, never as a touch.
   alert_events:
     - essl_ob_tap        # 🚨 composite — primary signal (TAP #1 + fresh OB only)
     - essl_tap           # 💧 price TOUCHED an eSSL level — every active level, fresh or old,

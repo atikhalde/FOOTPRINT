@@ -341,9 +341,64 @@ def test_essl_break():
     assert len(breaks) == 1, [(e.bar, e.extra) for e in breaks]
     assert breaks[0].bar == 62
     assert breaks[0].extra["reclaimed"] is False
+    # the bar that breaks the level is NEVER a touch alert: at this very close
+    # the indicator retires the level (first full penetration is terminal), so
+    # it is no longer an active eSSL when the alert's bar ends (FMGOETZE fix)
+    taps = [e for e in evs(res, K_ESSL_TAP) if e.pool_id == pool_id and e.bar == 62]
+    assert taps == [], taps
     p = next(p for p in res.pools if p.id == pool_id)
     assert not p.active
     print("ok test_essl_break")
+
+
+# ---------------------------------------------------------------------------
+# Test 4b: eSSL tap alerts REQUIRE the level to survive the bar as an active
+# reference (the FMGOETZE 2026-09-10/11 incident).
+#
+# The scanner alerted "💧 eSSL TAP 445.65 — close 443.55 below level → NOT
+# reclaimed" on a bar the indicator answers by RETIRING that level (first full
+# penetration + close below = L_CLOSED_BELOW, line gone). The level the
+# indicator actually tracked was the old 432.65, swept on 2026-09-11 (low
+# 431.20, close back above → RECLAIMED). Contract pinned here:
+#   * penetrate + close below  -> essl_break ONLY, never a tap (confirmed);
+#   * penetrate + close below  -> NO live tap either (mid-break provisional);
+#   * penetrate + reclaim      -> essl_sweep AND tap (the correct 432.65-style
+#                                 alert) on the confirmed bar, and the live
+#                                 tap fires on the provisional reclaim.
+# ---------------------------------------------------------------------------
+def test_essl_tap_never_alerts_a_level_break():
+    # confirmed: FMGOETZE 09-10 mirror (low well under the level, close below)
+    rows = essl_v_shape_rows()
+    rows.append((101.0, 101.2, 95.85, 95.90, 2500.0))   # bar 60: BREAK
+    res = run(rows)
+    pool_id = next(e.pool_id for e in evs(res, K_SSL_CREATED) if e.price == 96.0)
+    assert [e.bar for e in evs(res, K_ESSL_BREAK) if e.pool_id == pool_id] == [60]
+    assert [e for e in evs(res, K_ESSL_TAP)
+            if e.pool_id == pool_id and e.bar == 60] == []
+
+    # the SAME bar still forming: provisional close below -> not a touch either
+    live = Engine("TEST", EngineConfig(), TICK).run(make_df(rows[:61]), live_last_bar=True)
+    assert [e for e in live.events
+            if e.kind == K_ESSL_TAP and e.bar == 60] == [], \
+        "a mid-break forming bar must wait for the close"
+    pool = next(p for p in live.pools if p.id == pool_id)
+    assert pool.active, "termination waits for the confirmed close"
+
+    # confirmed: FMGOETZE 09-11 mirror (penetration + close back above)
+    rows2 = essl_v_shape_rows()
+    rows2.append((101.0, 101.2, 95.85, 97.50, 2500.0))  # bar 60: SWEEP
+    res2 = run(rows2)
+    pool2 = next(e.pool_id for e in evs(res2, K_SSL_CREATED) if e.price == 96.0)
+    assert [e.bar for e in evs(res2, K_ESSL_SWEEP) if e.pool_id == pool2] == [60]
+    taps2 = [e for e in evs(res2, K_ESSL_TAP) if e.pool_id == pool2 and e.bar == 60]
+    assert len(taps2) == 1 and taps2[0].extra["reclaimed"] is True, taps2
+
+    # the SAME bar still forming: provisional close back above -> LIVE tap
+    live2 = Engine("TEST", EngineConfig(), TICK).run(make_df(rows2[:61]), live_last_bar=True)
+    ltaps = [e for e in live2.events if e.kind == K_ESSL_TAP and e.bar == 60]
+    assert len(ltaps) == 1 and ltaps[0].confirmed is False, ltaps
+    assert ltaps[0].extra["reclaimed"] is True
+    print("ok test_essl_tap_never_alerts_a_level_break")
 
 
 # ---------------------------------------------------------------------------
@@ -621,6 +676,7 @@ ALL = [
     test_essl_pool_touch_and_sweep,
     test_essl_recovery_emits_reclaim,
     test_essl_break,
+    test_essl_tap_never_alerts_a_level_break,
     test_essl_eql_clustering,
     test_synthetic_invariants,
     test_composite_all_rules,
