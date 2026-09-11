@@ -139,16 +139,31 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
 
+      # Each suite is bounded and reported separately, with its FAIL/ERROR lines
+      # emitted as check annotations. A red X with no explanation is how "the
+      # scanner sends nothing" stayed invisible for a day: Actions logs are not
+      # always reachable (and a hung suite would have held the job until the
+      # step timeout), so the failure has to arrive in the checks UI by itself.
       - name: Engine + live-path tests
+        shell: bash
         run: |
-          python tests/test_engine.py
-          python tests/test_fidelity_live.py
-          python tests/test_live_scanner.py
-          python tests/test_tap_filters.py
-          python tests/test_essl_touch_alerts.py
-          python tests/test_universe.py
-          python tests/test_size_filters.py
-          python tests/test_alert_delivery.py
+          status=0
+          for t in test_engine test_fidelity_live test_live_scanner test_tap_filters \
+                   test_essl_touch_alerts test_universe test_size_filters test_alert_delivery; do
+            echo "::group::$t"
+            out=$(timeout 20m python "tests/$t.py" 2>&1); rc=$?
+            printf '%s\n' "$out" | tail -n 45
+            if [[ $rc -ne 0 ]]; then
+              status=1
+              detail=$(printf '%s\n' "$out" | grep -E '^(FAIL|ERROR)' | head -n 4 \
+                       | tr '\n' ' ' | tr -d '\r' | cut -c1-700)
+              [[ -n "$detail" ]] || detail="(no FAIL line — exit $rc; likely a crash or the 20m timeout)"
+              detail="${detail//%/ %25}"
+              echo "::error file=tests/$t.py::$t failed: $detail"
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
 
       - name: Restore alert deduplication state
         if: env.DRY_RUN != 'true'

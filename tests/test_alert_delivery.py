@@ -747,11 +747,15 @@ def test_shipped_config_covers_the_session():
     assert cfg.telegram.max_retries >= 2 and cfg.telegram.max_wait_sec >= 10
     assert cfg.scanner.alert_events == ["essl_ob_tap", "essl_tap", "footprint_tap"]
     assert cfg.scanner.provisional_alerts is True
-    # the workflow must actually grant what the re-arm needs
+    # The workflow must actually grant what the re-arm needs, run this suite, and
+    # publish the report. Suite names are matched without the `.py` because the
+    # step runs them through a loop (`for t in test_engine test_size_filters …`).
     wf = open(os.path.join(ROOT, ".github", "workflows", "scanner.yml"), encoding="utf-8").read()
     assert "actions: write" in wf and "GITHUB_TOKEN" in wf, "re-arm cannot dispatch"
-    assert "test_alert_delivery.py" in wf, "this suite must gate the Scan step"
+    assert "test_alert_delivery" in wf, "this suite must gate the Scan step"
     assert "state/scan_report.json" in wf, "the report belongs in the job summary"
+    assert "if: always() && env.DRY_RUN != 'true' && hashFiles(" in wf, \
+        "an empty state cache must not be publishable"
     print("ok test_shipped_config_covers_the_session")
 
 
