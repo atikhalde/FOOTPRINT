@@ -16,6 +16,7 @@ the default so scanner signals 1:1 match the TradingView indicator.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -101,6 +102,12 @@ def _add_run_mode_args(p) -> None:
     g.add_argument("--max-pass-minutes", dest="max_pass_minutes", type=float, metavar="MIN",
                    help="abort a single pass longer than this (0 = no ceiling; guards against "
                         "a stalled feed hanging the run)")
+    g.add_argument("--no-rotate", dest="no_rotate", action="store_true",
+                   help="always start a pass at the top of the symbol list (default: resume "
+                        "after the symbol where a cut pass stopped, so a long universe is "
+                        "fully covered even when every pass hits the ceiling)")
+    g.add_argument("--rotate", dest="rotate", action="store_true",
+                   help="force the universe rotation on (scanner.rotate_universe)")
 
 
 def cmd_scan(args):
@@ -121,6 +128,16 @@ def cmd_scan(args):
     notifier = TelegramNotifier(cfg.telegram)
     if args.max_runtime_minutes is not None:
         cfg.scanner.max_runtime_minutes = args.max_runtime_minutes
+    if getattr(args, "report_file", None) is not None:
+        cfg.scanner.report_file = args.report_file
+    if getattr(args, "no_reschedule", False):
+        cfg.scanner.reschedule_in_ci = False
+    if getattr(args, "reschedule", False):
+        cfg.scanner.reschedule_in_ci = True
+    if getattr(args, "rotate", False):
+        cfg.scanner.rotate_universe = True
+    if getattr(args, "no_rotate", False):
+        cfg.scanner.rotate_universe = False
     if not notifier.cfg.dry_run and not notifier.ready:
         # fail fast: a live scanner that cannot deliver is worse than no scanner
         print("Telegram is NOT configured (token/chat_id missing), so a live scan "
@@ -130,11 +147,15 @@ def cmd_scan(args):
               "scanner without alerts.", file=sys.stderr)
         sys.exit(2)
     if notifier.cfg.dry_run:
-        print("dry-run: Telegram messages will be printed, not sent.", file=sys.stderr)
+        print("dry-run: Telegram messages will be printed, not sent "
+              "(and the dedup state file is left untouched, so a preview can "
+              "never consume live alerts).", file=sys.stderr)
     from .scanner import LiveScanner
     sc = LiveScanner(cfg, notifier, refresh_fundamentals=args.refresh_fundamentals)
     if args.once:
         sc.scan_once()
+        # --once means "one pass, I will trigger the next one myself": never re-arm
+        _finish_scan(sc, "single pass (--once)", notifier, reschedule=False)
         return
     try:
         reason = sc.run_forever()
@@ -143,7 +164,77 @@ def cmd_scan(args):
         # catches an interrupt that landed before they were in place
         sc.request_stop("interrupted")
         reason = "interrupted"
+    _finish_scan(sc, reason, notifier)
+
+
+def _finish_scan(sc, reason: str, notifier, reschedule: bool = True) -> None:
+    """Report what the run did, then hand the rest of the session to a new run.
+
+    The report is the answer to "why did I get no alert?": it separates the
+    three things that all look identical in a quiet log — nothing to say
+    (universe scanned, no signal), nothing to scan (feed/size filters), and
+    something to say that could not be delivered (Telegram throttling/errors).
+    """
+    detail = ""
+    if not reschedule:
+        detail = "no (--once: the next run is yours to trigger)"
+    elif getattr(notifier.cfg, "dry_run", False):
+        detail = "no (dry run)"
+    if not detail:
+        from . import ci
+        _ok, detail = ci.maybe_reschedule(sc, reason)
+        print(f"fpfssl: {'re-armed' if _ok else 'no re-arm'}: {detail}")
+    sc._last_reason = reason          # so the report's `stop_reason` is the real one
+    rep = sc.report({"scanner_stopped": reason, "rescheduled": detail})
+    path = sc.write_report(rep=rep)
+    if path:
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(rep, fh, indent=2, sort_keys=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"fpfssl: could not write {path}: {e}", file=sys.stderr)
+    print(format_report(rep))
     print(f"scanner stopped: {reason}")
+
+
+def format_report(rep: dict) -> str:
+    """Human-readable block for the CI log (the JSON file feeds the summary)."""
+    st = rep.get("stats", {}) or {}
+    dl = rep.get("delivery", {}) or {}
+    lines = [
+        "",
+        "=" * 68,
+        "FPFSSL SCAN REPORT",
+        f"  market time   : {rep.get('market_time')}  "
+        f"({'open' if rep.get('market_open') else 'closed'})",
+        f"  feed / TF     : {rep.get('source')} {rep.get('interval')}"
+        f"   mode: {rep.get('mode')}",
+        f"  universe      : {rep.get('universe')} symbol(s), passes: {st.get('passes', 0)}"
+        f" (failed: {st.get('failed_passes', 0)})",
+        f"  scanned       : {st.get('scanned', 0)}  |  filtered out: {st.get('filtered', 0)}"
+        f" [{rep.get('size_filters')}]",
+        f"  no bars       : {st.get('no_bars', 0)}  |  short history: "
+        f"{st.get('skipped_short_history', 0)}  |  stale: {st.get('skipped_stale', 0)}",
+        f"  alerts sent   : {st.get('alerts', 0)}"
+        + ("" if rep.get("alerts_dry_run") is not True else " (DRY RUN — printed only)"),
+        f"  suppressed    : dedup {st.get('suppressed_dedup', 0)}, cooldown "
+        f"{st.get('suppressed_cooldown', 0)}  (state keys: {rep.get('state_keys')})",
+        f"  alert events  : {', '.join(rep.get('alert_events') or [])}",
+        f"  stopped       : {rep.get('stop_reason')}",
+        f"  re-armed      : {rep.get('rescheduled', 'n/a')}",
+    ]
+    if dl:
+        note = "" if dl.get("ready", True) else (
+            "  (not configured — a dry run prints instead of sending)"
+            if rep.get("alerts_dry_run") is True
+            else "  (NOT CONFIGURED: nothing can be delivered)")
+        lines.append(f"  telegram      : {dl.get('summary', '?')}{note}")
+        if dl.get("last_error"):
+            lines.append(f"  telegram error: {dl['last_error']}")
+    for ex in rep.get("suppressed_examples") or []:
+        lines.append(f"    · {ex}")
+    lines.append("=" * 68)
+    return "\n".join(lines)
 
 
 def cmd_backtest(args):
@@ -336,6 +427,13 @@ def main(argv=None):
     s.add_argument("--max-runtime-minutes", type=float, metavar="MIN",
                    help="stop polling after this many minutes even if the session is "
                         "still open (0 = no limit; CI sets it below the job timeout)")
+    s.add_argument("--report-file", dest="report_file", metavar="PATH",
+                   help="write the end-of-run JSON report here ('' = don't write one)")
+    s.add_argument("--reschedule", action="store_true",
+                   help="force the CI self re-arm on: dispatch one more Actions run when this "
+                        "one stops while the market day is still live (needs GITHUB_TOKEN)")
+    s.add_argument("--no-reschedule", dest="no_reschedule", action="store_true",
+                   help="never re-arm; rely on the workflow schedule alone")
     _add_filter_args(s)
     _add_run_mode_args(s)
     s.set_defaults(fn=cmd_scan)

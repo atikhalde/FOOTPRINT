@@ -405,8 +405,15 @@ def test_max_pass_minutes_abandons_a_stalled_fetch():
     dur = time.time() - t0
     assert total == 0
     assert dur < 6.0, f"pass should be cut at the ceiling, took {dur:.1f}s"
-    assert sc.stop_requested and "stalled" in sc.stop_reason, sc.stop_reason
-    print(f"ok test_max_pass_minutes_abandons_a_stalled_fetch (returned in {dur:.2f}s)")
+    # The ceiling ends the PASS; it must NOT stop the run. A stalled feed is a
+    # reason to retry on the next poll — `request_stop()` here used to end the
+    # whole session worker, so one 10-minute yahoo hiccup meant "no alerts for
+    # the rest of the day" (the next cron tick is hours away, if it arrives).
+    assert not sc.stop_requested, f"a stalled pass stopped the run: {sc.stop_reason}"
+    assert sc.stats.get("failed_passes", 0) == 1, sc.stats
+    assert sc.consecutive_failures() == 1, sc.stats
+    print(f"ok test_max_pass_minutes_abandons_a_stalled_fetch "
+          f"(returned in {dur:.2f}s, pass failed, session kept alive)")
 
 
 ALL = [

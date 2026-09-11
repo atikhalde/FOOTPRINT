@@ -263,6 +263,79 @@ class LiveScanner:
         self._init_runtime()
         self._load_state()
         self.fundamentals = fundamentals
+        self._reset_stats()
+
+    # -- run statistics (what a silent pass has to explain) -------------------
+    def _reset_stats(self) -> None:
+        """Per-run counters, reported by `report()` / `scan_report.json`."""
+        self.stats: dict = {
+            "passes": 0, "failed_passes": 0, "symbols": 0, "scanned": 0,
+            "filtered": 0, "no_bars": 0, "skipped_short_history": 0,
+            "skipped_stale": 0, "alerts": 0, "suppressed_dedup": 0,
+            "suppressed_cooldown": 0, "engine_errors": 0,
+        }
+        self.suppressed_examples: list[str] = []
+
+    def _bump(self, key: str, n: int = 1) -> None:
+        st = getattr(self, "stats", None)
+        if st is None:                       # a scanner built with __new__ (tests)
+            self.stats = {}
+            st = self.stats
+        st[key] = st.get(key, 0) + n
+
+    def report(self, extra: dict | None = None) -> dict:
+        """Everything needed to answer "why is there no alert?" in one object."""
+        cfg = self.cfg
+        st = dict(getattr(self, "stats", {}) or {})
+        rep = {
+            "generated": datetime.now().isoformat(timespec="seconds"),
+            "market_time": market_now(cfg).strftime("%Y-%m-%d %H:%M %a"),
+            "market_open": market_is_open(cfg),
+            "interval": cfg.data.interval,
+            "source": cfg.data.source,
+            "universe": len(self.symbols),
+            "mode": ("one pass then exit" if self.exit_after_pass
+                     else f"poll every {cfg.scanner.poll_minutes:g} min until the close"),
+            "alerts_dry_run": bool(cfg.telegram.dry_run),
+            "alert_events": list(cfg.scanner.alert_events or []),
+            "size_filters": self.filters.describe(),
+            "state_keys": len(self.state.get("alerted", {})),
+            "rearm_chain": dict(self.state.get("chain") or {}),
+            "stop_reason": (getattr(self, "_last_reason", "")
+                            or self.stop_reason or "running"),
+            "stats": st,
+        }
+        if hasattr(self.notifier, "describe"):
+            rep["delivery"] = {
+                "ready": bool(getattr(self.notifier, "ready", True)),
+                "summary": self.notifier.describe(),
+            }
+            deliv = getattr(self.notifier, "stats", None)
+            if isinstance(deliv, dict):
+                rep["delivery"].update({k: int(v or 0) for k, v in deliv.items()})
+            err = getattr(self.notifier, "last_error", "")
+            if err:
+                rep["delivery"]["last_error"] = err
+        examples = getattr(self, "suppressed_examples", None) or []
+        if examples:
+            rep["suppressed_examples"] = list(examples[:5])
+        if extra:
+            rep.update(extra)
+        return rep
+
+    def write_report(self, path: str | None = None, rep: dict | None = None) -> str:
+        """Dump `report()` next to the dedup state so CI can publish it."""
+        p = path if path is not None else getattr(self.cfg.scanner, "report_file", "") or ""
+        if not p:
+            return ""
+        try:
+            os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            with open(p, "w", encoding="utf-8") as fh:
+                json.dump(rep or self.report(), fh, indent=2, sort_keys=True)
+            return p
+        except Exception as e:  # noqa: BLE001 - a report never breaks a scan
+            log.warning("could not write the scan report to %s: %s", p, e)
+            return ""
 
     @property
     def exit_after_pass(self) -> bool:
@@ -455,16 +528,37 @@ class LiveScanner:
         self.state.setdefault("cooldown", {})
 
     def _save_state(self):
+        """Persist the dedup/cooldown state (and the re-arm counter).
+
+        A dry run must never write it: `send()` reports success for a printed
+        message, so persisting those keys makes the *next live* pass believe the
+        alerts already went out and swallow them — a `--dry-run` preview used to
+        silence a whole session this way (see `run_forever`'s exit path).
+        """
         p = self.cfg.scanner.state_file
+        if not p:
+            return
+        if getattr(self.cfg.telegram, "dry_run", False):
+            log.debug("dry run: state file %s left untouched", p)
+            return
         os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-        # keep the file bounded
+        # keep the file bounded: an unbounded `alerted` map (every symbol ×
+        # every bar × every level) is what turns the Actions cache into a
+        # multi-megabyte restore on each run
+        cutoff = (datetime.now() - timedelta(days=14)).isoformat()
         alerted = self.state["alerted"]
         if len(alerted) > 20000:
-            cutoff = (datetime.now() - timedelta(days=14)).isoformat()
             alerted = {k: v for k, v in alerted.items() if v >= cutoff}
             self.state["alerted"] = alerted
-        with open(p, "w", encoding="utf-8") as fh:
+        cooldown = self.state.get("cooldown") or {}
+        if len(cooldown) > 5000:
+            fresh = (datetime.now() - timedelta(days=2)).isoformat()
+            cooldown = {k: v for k, v in cooldown.items() if v >= fresh}
+            self.state["cooldown"] = cooldown
+        tmp = f"{p}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.state, fh)
+        os.replace(tmp, p)         # never leave a half-written state behind
 
     # -- alerting ------------------------------------------------------------
     def _try_alert(self, sym: str, kind: str, message: str, dedup_key: str,
@@ -492,12 +586,17 @@ class LiveScanner:
         sc = self.cfg.scanner
         now = datetime.now()
         if dedup_key in self.state["alerted"]:
+            self._bump("suppressed_dedup")
+            self._note_suppressed(sym, kind, "already alerted (dedup state)")
             return False
         cd_key = cooldown_key or f"{sym}|{kind}"
         last = self.state["cooldown"].get(cd_key)
         if last and not (follow_up_of and follow_up_of in self.state["alerted"]):
             try:
                 if now - datetime.fromisoformat(last) < timedelta(minutes=sc.alert_cooldown_minutes):
+                    self._bump("suppressed_cooldown")
+                    self._note_suppressed(sym, kind, f"inside the {sc.alert_cooldown_minutes:g}-min "
+                                                     "cooldown of the previous alert")
                     return False
             except Exception:  # noqa: BLE001
                 pass
@@ -509,12 +608,27 @@ class LiveScanner:
             # live alerts.
             self.state["alerted"][dedup_key] = now.isoformat()
             self.state["cooldown"][cd_key] = now.isoformat()
+            self._bump("alerts")
             if not self.cfg.telegram.dry_run:
                 self._save_state()
         return ok
 
+    def _note_suppressed(self, sym: str, kind: str, why: str) -> None:
+        """Keep a few examples of *why* a signal was not delivered.
+
+        'No alerts' and 'alerts suppressed' look identical in a log line; the
+        run report quotes the first few so a reader can tell the difference.
+        """
+        ex = getattr(self, "suppressed_examples", None)
+        if ex is None:
+            self.suppressed_examples = []
+            ex = self.suppressed_examples
+        if len(ex) < 5:
+            ex.append(f"{sym} {kind}: {why}")
+
     # -- single symbol pass ----------------------------------------------------
-    def scan_symbol(self, sym: str, df: pd.DataFrame | None = None) -> int:
+    def scan_symbol(self, sym: str, df: pd.DataFrame | None = None,
+                    market_last=None) -> int:
         cfg = self.cfg
         tf = timeframe_label(cfg.data.interval)
         if df is None:
@@ -522,10 +636,13 @@ class LiveScanner:
                 df = load_symbol(sym, cfg.data)
             except DataError as e:
                 log.warning("%s: %s", sym, e)
+                self._bump("no_bars")
                 return 0
         if len(df) < cfg.scanner.min_bars:
             log.info("%s: only %d bars (< %d), skipped", sym, len(df), cfg.scanner.min_bars)
+            self._bump("skipped_short_history")
             return 0
+        self._pass_bars = getattr(self, "_pass_bars", 0) + 1
         # ---- size filters (market cap / price) ------------------------------
         # Before the staleness checks and, above all, before the engine: the
         # whole point of `min_market_cap_cr` / `min_price` is that a stock that
@@ -536,16 +653,30 @@ class LiveScanner:
         keep, why = self.size_ok(sym, price_last)
         if not keep:
             self.filtered = getattr(self, "filtered", 0) + 1
+            self._bump("filtered")
             log.info("%s: skipped by the size filters — %s", sym, why)
             return 0
         self.scanned = getattr(self, "scanned", 0) + 1
         now_mkt = market_now(cfg)
         last_ts = df.index[-1]
         if cfg.data.source == "yahoo":
-            stale_days = trading_days_between(last_ts, now_mkt)
+            # Staleness is measured against the MARKET, not the wall clock: the
+            # whole universe stops printing on an NSE holiday (and Diwali/Republic
+            # Day breaks routinely run past `max_stale_days` trading days), so a
+            # calendar-only rule drops every symbol at once and the scanner goes
+            # silent on exactly the days it should still be arming itself. A
+            # delisted/suspended ticker still lags the market's newest bar, so it
+            # is caught by the same check.
+            ref = market_last if market_last is not None else now_mkt
+            stale_days = trading_days_between(last_ts, ref)
             if stale_days > cfg.scanner.max_stale_days:
-                log.warning("%s: last bar %s is %d trading days old, skipped",
-                            sym, last_ts, stale_days)
+                behind = "the market's newest bar" if market_last is not None \
+                    else "the market clock"
+                log.warning("%s: last bar %s is %d trading day(s) behind %s "
+                            "(scanner.max_stale_days=%d), skipped",
+                            sym, last_ts, stale_days, behind,
+                            cfg.scanner.max_stale_days)
+                self._bump("skipped_stale")
                 return 0
             if cfg.data.is_intraday() and market_is_open(cfg, now_mkt):
                 open_dt, _ = _session_bounds(cfg, now_mkt)
@@ -770,17 +901,24 @@ class LiveScanner:
         self._pass_deadline = (time.monotonic() + budget) if budget else None
         self.filtered = 0
         self.scanned = 0
+        if getattr(self, "stats", None) is None:
+            self.stats = {}
+        self.stats["symbols"] = len(self.symbols)
+        self._pass_bars = 0    # symbols that produced usable bars THIS pass
         # One batched yahoo fetch for the whole universe (full-NSE daily pass
         # = thousands of tickers: per-symbol fetches would crawl). Each symbol
         # then runs the engine over the same frame the per-symbol path would
         # have fetched, so signals are identical — only the transport differs.
         frames: dict[str, pd.DataFrame] = {}
-        if self.cfg.data.source == "yahoo" and len(self.symbols) > 1 and self.cfg.data.batch:
+        batched = (self.cfg.data.source == "yahoo" and len(self.symbols) > 1
+                   and self.cfg.data.batch)
+        if batched:
             left = budget
             run_deadline = getattr(self, "_runtime_deadline", None)
             if run_deadline is not None:
                 rem = run_deadline - time.monotonic()
                 left = rem if left is None else min(left, rem)
+            stalled = False
             try:
                 got, stalled = self._timed(
                     lambda: load_all(self.symbols, self.cfg.data),
@@ -792,18 +930,46 @@ class LiveScanner:
                 log.error("batch load failed: %s", e)
                 got, stalled = {}, False
             if stalled:
-                # The ceiling exists precisely so a hung feed cannot hold the
-                # runner open forever: report it and end the run cleanly
-                # (dedup state saved) instead of retrying per-symbol against the
-                # same stalled endpoint for hours.
+                # The ceiling exists so a hung feed cannot hold the runner open
+                # forever. It ends THIS pass — it must never end the session
+                # worker: `request_stop()` used to do that, so one 10-minute
+                # yahoo hiccup at 09:30 silently killed the rest of the day
+                # (and the next cron tick may be hours away).
                 log.error("no bars this pass: the yahoo fetch stalled past "
-                          "scanner.max_pass_minutes (%d symbol(s) affected)",
+                          "scanner.max_pass_minutes (%d symbol(s) affected) — "
+                          "keeping the scanner alive for the next poll",
                           len(self.symbols))
-                self.request_stop("yahoo fetch stalled past the pass ceiling")
+                self._note_pass(False)
+                self.write_report()
                 return 0
             frames = got or {}
+            if not frames:
+                # A batch that answered with nothing (rate limit, a yahoo
+                # outage) must not fan out into one sequential request per
+                # ticker for the whole universe: that burns the entire job
+                # timeout against the endpoint that just failed. Small symbol
+                # lists still get the per-symbol retry, which is genuinely
+                # useful when the bulk call chokes on one ticker.
+                if len(self.symbols) > max(1, int(self.cfg.data.batch_size or 100)):
+                    log.error("yahoo returned no bars for any of %d symbol(s) — "
+                              "skipping this pass instead of re-fetching them one "
+                              "by one; the next poll retries", len(self.symbols))
+                    self._note_pass(False)
+                    self.write_report()
+                    return 0
+                log.warning("yahoo batch returned no bars for %d symbol(s) — "
+                            "retrying per symbol", len(self.symbols))
             log.info("fetched %d/%d symbols in %.1fs",
                      len(frames), len(self.symbols), time.time() - t0)
+        # Staleness reference: the newest bar the MARKET produced this pass (see
+        # scan_symbol). A holiday shifts every symbol equally, so comparing to
+        # the clock would drop the whole universe.
+        market_last = None
+        if frames:
+            try:
+                market_last = max(df.index[-1] for df in frames.values() if len(df))
+            except Exception:  # noqa: BLE001 - falls back to the wall clock
+                market_last = None
         # Market-cap size filter: warm the share-count cache for exactly the
         # symbols that can reach it, once per pass (in-memory afterwards, so
         # scan_symbol never touches the network). Also under the pass ceiling:
@@ -826,8 +992,23 @@ class LiveScanner:
                             "fails open for this pass", e)
         missing = 0
         done = 0
+        consumed = 0
         stopped = ""
-        for sym in self.symbols:
+        # Universe rotation. `max_pass_minutes` cuts a pass at a symbol
+        # boundary, and a full-NSE list is alphabetical — so without a cursor
+        # every run rescans the same head of the list and the tail can never
+        # alert. The start offset lives in the persisted state, so it also
+        # survives between CI runs (each of which is one pass).
+        cursor = 0
+        rotate = bool(getattr(self.cfg.scanner, "rotate_universe", True))
+        n_sym = len(self.symbols)
+        if rotate and n_sym > 1:
+            cursor = int(self.state.get("cursor", 0) or 0) % n_sym
+        order = self.symbols if not cursor else self.symbols[cursor:] + self.symbols[:cursor]
+        if cursor:
+            log.info("resuming the universe at position %d/%d (an earlier pass was "
+                     "cut before it finished the list)", cursor, n_sym)
+        for sym in order:
             # A stop request (or an expired budget) must not wait for the rest
             # of a full-NSE pass (thousands of symbols): bail out at the next
             # symbol boundary.
@@ -837,27 +1018,42 @@ class LiveScanner:
             if self.pass_out_of_time():
                 stopped = "pass ceiling reached (%d min)" % int((budget or 0) / 60)
                 log.warning("stopping the pass early: %s — %d/%d symbols scanned",
-                            stopped, done, len(self.symbols))
+                            stopped, done, n_sym)
                 break
             try:
                 if frames:
                     df = frames.get(sym)
                     if df is None:
                         missing += 1
+                        consumed += 1
                         continue  # no bars for this symbol (dead ticker etc.)
-                    total += self.scan_symbol(sym, df)
+                    total += self.scan_symbol(sym, df, market_last=market_last)
                 else:
                     total += self.scan_symbol(sym)
             except Exception as e:  # noqa: BLE001
+                self._bump("engine_errors")
                 log.exception("symbol %s failed: %s", sym, e)
             done += 1
+            consumed += 1
+        self._bump("scanned", done)
+        self._bump("no_bars", missing)
+        if stopped and rotate and n_sym:
+            self.state["cursor"] = (cursor + consumed) % n_sym
+        elif stopped == "" and n_sym:
+            self.state["cursor"] = 0
         if missing:
             log.info("%d symbol(s) returned no bars and were skipped", missing)
         if stopped:
             log.info("pass stopped early (%s): %d/%d symbols scanned", stopped,
-                     done, len(self.symbols))
+                     done, n_sym)
+        # A pass counts as healthy when at least one symbol produced usable
+        # bars. Signals, filters and dedup are all allowed to produce nothing;
+        # a feed that answers with nothing is not — that is the case the poller
+        # must retry instead of treating as a completed scan.
+        self._note_pass(getattr(self, "_pass_bars", 0) > 0)
         if not self.cfg.telegram.dry_run:
             self._save_state()
+        self.write_report()      # so even a run killed mid-session left a report
         tf = timeframe_label(self.cfg.data.interval)
         skipped = getattr(self, "filtered", 0)
         flt = self.filters
@@ -869,24 +1065,66 @@ class LiveScanner:
                     % (getattr(self, "scanned", 0), skipped, flt.describe()))
         log.info("scan finished in %.1fs: %d new alert(s) across %d symbols [%s]%s",
                  time.time() - t0, total, len(self.symbols), tf, tail)
+        if total == 0:
+            log.info("no alert this pass: %s", self.quiet_reason())
         return total
+
+    # -- pass bookkeeping -----------------------------------------------------
+    def _note_pass(self, ok: bool) -> None:
+        """Count a pass and remember the consecutive failures (for the poller)."""
+        self._bump("passes")
+        st = getattr(self, "stats", None)
+        if st is None:
+            self.stats = {}
+            st = self.stats
+        if ok:
+            st["consecutive_failures"] = 0
+        else:
+            st["failed_passes"] = st.get("failed_passes", 0) + 1
+            st["consecutive_failures"] = st.get("consecutive_failures", 0) + 1
+        self._pass_failed = not ok
+
+    def consecutive_failures(self) -> int:
+        return int((getattr(self, "stats", None) or {}).get("consecutive_failures", 0))
+
+    def quiet_reason(self) -> str:
+        """One line that explains a pass that sent nothing."""
+        st = getattr(self, "stats", None) or {}
+        bits = [f"universe {len(self.symbols)}",
+                f"scanned {st.get('scanned', 0)}",
+                f"filtered {st.get('filtered', 0) if 'filtered' in st else getattr(self, 'filtered', 0)}",
+                f"no bars {st.get('no_bars', 0)}",
+                f"short history {st.get('skipped_short_history', 0)}",
+                f"stale {st.get('skipped_stale', 0)}",
+                f"already alerted {st.get('suppressed_dedup', 0)}",
+                f"cooldown {st.get('suppressed_cooldown', 0)}"]
+        why = ", ".join(bits)
+        if getattr(self, "_pass_failed", False):
+            why = "the feed produced no bars this pass (nothing could be checked); " + why
+        if getattr(self, "suppressed_examples", None):
+            why += " — e.g. " + "; ".join(self.suppressed_examples[:2])
+        return why
 
     def run_forever(self) -> str:
         """Poll the market (or run a single pass) until it is time to stop.
 
-        Two modes, and the reason `exit_after_pass` exists is that the first
-        one is easy to mistake for a hang:
+        Two modes:
 
+        * `scanner.exit_after_pass: false` (shipped) — this process IS the
+          session worker: poll until the session ends (`stop_after_close_minutes`
+          past the close). Necessary because GitHub's `schedule` trigger delivers
+          a fraction of its ticks (this repo: 2 of ~80 on a session day), so a
+          "one tick, one pass" design spends sessions unscanned.
         * `scanner.exit_after_pass: true` — ONE complete pass over the universe,
-          save the dedup state, exit. A scheduled run therefore ends as soon as
-          it has scanned the market instead of sitting in the runner until the
-          close, and the next cron tick does the next pass.
-        * `scanner.exit_after_pass: false` — poll until the session ends
-          (`stop_after_close_minutes` past the close). This is the design for a
-          single scheduled trigger that has to cover the whole NSE session
-          (09:15-15:30 IST), because GitHub's cron is best-effort and drops most
-          ticks of a 5-minute schedule; it costs a ~6h job that every later tick
-          queues behind.
+          save the dedup state, exit. Cheaper and resumable; right when something
+          else pings every few minutes (`repository_dispatch` from an external
+          scheduler, or the self re-arm below acting as that pinger).
+
+        In both modes a run that stops while the market day is still live can
+        hand the rest of the session to one successor run
+        (`scanner.reschedule_in_ci`, fpfssl/ci.py) — that is what makes coverage
+        independent of Actions cron, and it is why a runtime budget below the
+        session length is safe.
 
         Other behaviour (both modes):
 
@@ -894,7 +1132,11 @@ class LiveScanner:
           is within `preopen_wait_minutes`), then scans
         * started after the close    -> one final pass, then exits
         * a pass longer than `max_pass_minutes` -> cut at the next symbol
-          boundary, state saved, so a slow feed cannot outrun the job timeout
+          boundary, state saved, and the next pass resumes at that symbol
+          (`rotate_universe`) so the tail of the universe still gets scanned
+        * a pass that produced no data (stalled/rate-limited feed) -> retried on
+          the next poll; only `max_pass_failures` consecutive data-less passes
+          end the run, because quitting here would mean no alerts for the day
 
         Stops (saving dedup state) on any of:
         * `exit_after_pass` (one pass per run);
@@ -950,6 +1192,7 @@ class LiveScanner:
                     self.scan_once()
                 except Exception as e:  # noqa: BLE001
                     log.exception("scan pass failed: %s", e)
+                    self._note_pass(False)
                 stopped = self._stop_now()
                 if stopped:
                     reason = stopped
@@ -957,11 +1200,24 @@ class LiveScanner:
                         log.info("%s — scanner exiting (dedup state saved; the next "
                                  "run picks the session back up)", reason)
                     break
+                # A pass that produced nothing (yahoo stalling/rate-limiting)
+                # is a reason to retry, not a reason to quit: `scan_once()` used
+                # to `request_stop()` on a stall, which ended the whole session
+                # worker on a transient feed hiccup. Retry on the normal cadence
+                # and only give up after `scanner.max_pass_failures` in a row.
+                fails = self.consecutive_failures()
+                cap = int(getattr(self.cfg.scanner, "max_pass_failures", 0) or 0)
+                if fails and cap and fails >= cap:
+                    reason = f"{cap} consecutive passes produced no data"
+                    log.error("%s — giving up the session (the feed is down, not "
+                              "the scanner)", reason)
+                    break
                 # scanner.exit_after_pass: the point is that a completed pass is
                 # a finished job. Napping here to wait for the next poll is what
                 # makes a scheduled run look stuck (and blocks the concurrency
                 # group for hours); the dedup state is already saved by
-                # scan_once, so the next tick resumes exactly where this ended.
+                # scan_once, so the next tick (or the re-armed run) resumes
+                # exactly where this ended.
                 if self.exit_after_pass:
                     reason = "scan complete (scanner.exit_after_pass)"
                     log.info("%s — %d symbol(s) scanned%s, scanner exiting "
@@ -984,16 +1240,23 @@ class LiveScanner:
                     nap = poll * 60.0
                 else:
                     nap = min(poll * 60.0, max(30.0, until_close * 60.0))
+                if fails:
+                    log.info("retrying the feed in %.0f min (%d failed pass(es) so far)",
+                            nap / 60.0, fails)
                 if not self._sleep(nap):
                     reason = self._stop_now() or "stop requested"
                     break
         finally:
+            self._last_reason = reason
             self.restore_stop_handlers()
             # never lose the dedup state on the way out: without it the next
-            # pass would re-announce every alert of this run
+            # pass would re-announce every alert of this run. `_save_state()`
+            # itself refuses to write on a dry run — a preview that persisted its
+            # "sent" keys would swallow the next session's real alerts.
             try:
                 self._save_state()
             except Exception as e:  # noqa: BLE001
                 log.warning("could not save scanner state: %s", e)
             log.info("scanner stopped (%s)", reason)
+        self._last_reason = reason
         return reason

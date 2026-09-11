@@ -233,15 +233,49 @@ class ScannerConfig:
     # being killed mid-pass.
     max_runtime_minutes: float = 0.0
     # exit_after_pass: `scan` without --once stops after ONE complete pass
-    # instead of napping until the close. Without it a scheduled run holds the
-    # runner for the rest of the session (~6h) and every later cron tick queues
-    # behind it, which reads as "the scanner is stuck". true = one pass, save
-    # the dedup state, exit; let the next tick (or a new run) do the next pass.
+    # instead of napping until the close.
+    #   false (the shipped default) = the run IS the session worker: it polls
+    #     until `stop_after_close_minutes` past the close, or until
+    #     `max_runtime_minutes` cuts it (then `scanner.reschedule_in_ci` hands
+    #     the rest of the session to a re-armed run). GitHub's `schedule`
+    #     trigger delivers only a fraction of its ticks — this repo sees ~1 of
+    #     40 — so "one tick, one pass" leaves most of the session unscanned and
+    #     reads as "the scanner sends nothing". Polling inside one bounded job is
+    #     what actually covers the session.
+    #   true = cheapest, most resumable mode (a pass per trigger, no runner
+    #     held). Use it when an external scheduler pings `repository_dispatch`
+    #     every few minutes, or with `reschedule_in_ci` as the pinger.
     exit_after_pass: bool = False
     # Ceiling for a single pass (batch fetch + engine loop). The batched yahoo
     # fetch waits on this and abandons a stalled download instead of hanging
     # forever; the per-symbol loop stops at the next symbol boundary. 0 = off.
     max_pass_minutes: float = 0.0
+    # A failed pass (the feed stalled, the batch download raised) must NOT end
+    # the session worker: the next poll retries it. Only after this many
+    # *consecutive* failed passes does the run give up (state saved) — so a
+    # 10-minute yahoo hiccup cannot turn into "the scanner never ran again
+    # today", while a real outage still ends the job cleanly.
+    max_pass_failures: int = 6
+    # When one pass cannot finish the universe inside `max_pass_minutes`, keep
+    # going where it stopped instead of re-scanning the same first N symbols on
+    # every run: the scan order is rotated by a cursor persisted in the state
+    # file. Without it, the tail of an alphabetically sorted universe can never
+    # alert — the ceiling cuts the pass at the same place every time.
+    rotate_universe: bool = True
+    # Machine-readable per-pass report (what was scanned, what was filtered, how
+    # many alerts were delivered). The Scanner workflow appends it to the job
+    # summary so "no alerts" is explainable from the run page. Default "" so an
+    # in-process / test run never writes into a real state directory; the shipped
+    # config.yaml turns it on.
+    report_file: str = ""
+    # Self re-arm: when a session-long run stops while the market is still open
+    # (runtime budget, a stalled pass, the pass ceiling), dispatch one more
+    # Actions run instead of waiting for a cron tick — GitHub delivers scheduled
+    # ticks late or not at all, and session coverage depends on it. Needs
+    # GITHUB_TOKEN + GITHUB_REPOSITORY in the environment; a no-op anywhere else
+    # (see fpfssl/ci.py).
+    reschedule_in_ci: bool = True
+    reschedule_max_runs_per_day: int = 40    # runaway-loop guard, per market day
 
 
 @dataclass
@@ -252,6 +286,21 @@ class TelegramConfig:
     chat_id: str | None = None           # or env TELEGRAM_CHAT_ID
     api_base: str = "https://api.telegram.org"
     timeout: float = 15.0
+    # ---- delivery limits (Telegram allows ~1 message/second PER CHAT) -------
+    # A full-universe pass can raise hundreds of taps at once. Sending them
+    # back-to-back used to end in `429 Too Many Requests`, and every rejected
+    # message was simply lost — a green run that delivered nothing. The notifier
+    # now paces itself, honours `retry_after` and retries, so an alert is
+    # deferred instead of dropped (see fpfssl/telegram.py).
+    min_interval_sec: float = 1.0        # spacing between two sends to this chat
+    max_retries: int = 4                 # attempts per message (429/5xx/network)
+    retry_backoff_sec: float = 2.0       # base for the exponential backoff
+    max_wait_sec: float = 90.0           # total waiting budget per message
+    # After a message exhausts its retries, stop talking to Telegram for this
+    # long: a chat that is refusing sends must not turn a scan pass into hours of
+    # waiting. Deferred alerts are retried on the next pass (they were never
+    # recorded as sent), so this costs latency, not signals.
+    mute_after_failure_sec: float = 60.0
 
 
 @dataclass
@@ -283,8 +332,21 @@ class AppConfig:
 
 
 def _mk(dc, d):
+    """Build a config section, warning about — not swallowing — unknown keys.
+
+    A typo like `min_market_cap: 500` next to the real `min_market_cap_cr` used
+    to be dropped in silence: the filter the user thinks is configured is not,
+    and a setting that never loads is indistinguishable from a working default.
+    """
+    import logging
+
     d = d or {}
     known = {f for f in dc.__dataclass_fields__}
+    unknown = [k for k in d if k not in known]
+    if unknown:
+        logging.getLogger("fpfssl.config").warning(
+            "%s: ignoring unknown config key(s) %s (valid: %s)", dc.__name__,
+            ", ".join(sorted(unknown)), ", ".join(sorted(known)))
     return dc(**{k: v for k, v in d.items() if k in known})
 
 

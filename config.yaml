@@ -61,13 +61,16 @@ scanner:
   alert_cooldown_minutes: 60 # per symbol+event-type spam guard (across different bars)
   min_bars: 600          # skip symbols with less history (ATR/MA/pivot/SSL/pool warmup)
   stop_after_close_minutes: 15   # keep polling this long past 15:30 IST for the closing bar
-  preopen_wait_minutes: 60       # started earlier than this before the open -> single pass, exit
+  preopen_wait_minutes: 180      # started up to this far before the open -> wait for the
+                                 # bell (started earlier: one pass, then exit)
   # Hard wall-clock budget for `scan` (no --once): after this many minutes the
-  # poller saves its dedup state and exits cleanly even mid-session, so a long
-  # CI job always ends by itself instead of being killed mid-pass (a queued
-  # cron tick takes over). 0 = unlimited (the market clock alone decides) —
-  # the Actions workflow passes --max-runtime-minutes 325 explicitly.
-  max_runtime_minutes: 0         # 0 = no limit; CI sets 325 (under its 350-min job timeout)
+  # poller saves its dedup state and exits cleanly even mid-session, so a long CI
+  # job always ends by itself instead of being killed mid-pass. `scanner.reschedule_in_ci`
+  # then hands the rest of the session to a fresh run (the dedup state is saved,
+  # so a resumed run never re-announces an alert). 0 = unlimited (the market
+  # clock alone decides). 280 keeps a job under GitHub's 6h per-job limit while
+  # still covering most of the 09:15-15:30 IST session.
+  max_runtime_minutes: 280       # 0 = no limit; CI may raise it, never past its job timeout
   max_stale_days: 4      # skip symbols whose last bar is older than this many TRADING days (weekends OK)
   max_lag_minutes: 90    # intraday: skip when market is open but the feed lags more than this
   market_timezone: Asia/Kolkata  # live NSE clock (IST)
@@ -87,12 +90,40 @@ scanner:
                                  # (a metadata outage must never swallow alerts)
   market_cap_cr_overrides: {}  # pin a symbol's ₹ crore when you know better, e.g.
                                # {TATASTEEL.NS: 95000} — also the offline escape hatch
-  # ---- stop after the scan instead of holding the runner ----
-  # true: `scan` (without --once) does ONE complete pass over the universe,
-  # saves its dedup state and exits. false: keep polling until the close (the
-  # original CI design, which covers the session from a single tick — but it
-  # holds the job for ~6h and queues every later cron tick behind it).
-  exit_after_pass: true
+  # ---- how one run covers the session ----
+  # false (default): `scan` (without --once) polls the market until the close
+  # (+ `stop_after_close_minutes`) or until `max_runtime_minutes` cuts it. This
+  # is what makes a session work: GitHub's `schedule` trigger delivered 2 of ~80
+  # ticks on a session day here and both landed after 15:30 IST, so "one tick ->
+  # one pass" spends the whole session scanning nothing.
+  # true: one complete pass per run, save the dedup state, exit. Use it when an
+  # external pinger drives `repository_dispatch`, or with the self re-arm below
+  # as the pinger (every finished pass immediately queues the next one).
+  exit_after_pass: false
+  # Consecutive passes that produced NO DATA (yahoo stalling / rate-limited)
+  # before the run gives up. A failed pass is a reason to retry, not to end the
+  # session worker: killing it on one feed hiccup used to mean "no alerts for the
+  # rest of the day", because the next tick is GitHub's, i.e. hours away.
+  max_pass_failures: 6
+  # A pass cut by `max_pass_minutes` resumes where it stopped (the offset is
+  # persisted in the state file) instead of rescanning the same head of an
+  # alphabetically sorted universe - otherwise the tail of full_nse can never
+  # alert, since the ceiling cuts the pass at the same place every run.
+  rotate_universe: true
+  # Machine-readable end-of-run report (universe scanned / filtered / no-data
+  # counts, alerts sent, dedup+cooldown suppressions, Telegram delivery stats,
+  # why the run stopped). The Scanner workflow appends it to the job summary so
+  # "no alerts" is explainable from the run page. "" = off.
+  report_file: state/scan_report.json
+  # ---- self re-arm: cover the session even when Actions cron does not ----
+  # A run that stops while the market day is still live dispatches exactly ONE
+  # successor (workflow_dispatch via GITHUB_TOKEN), so the chain - not GitHub's
+  # best-effort scheduler - keeps the scanner running to the close. Inert outside
+  # Actions, never armed by a dry run or a user cancel, and capped per market day.
+  # Needs `permissions: actions: write` in the workflow (and Settings -> Actions
+  # -> General -> Workflow permissions: "Read and write" if the org caps it).
+  reschedule_in_ci: true
+  reschedule_max_runs_per_day: 40
   # Ceiling for ONE pass (fetch + engine loop). A stalled yahoo download is
   # abandoned in a daemon thread at this point instead of hanging the job
   # forever — the hang that made a completed scan look like a stuck scanner.
@@ -132,6 +163,21 @@ scanner:
 
 telegram:
   enabled: true
+  # ---- delivery limits (Telegram allows ~1 message/second PER CHAT) ----
+  # A full-NSE pass raises hundreds of taps at once. Sent back-to-back, Telegram
+  # answers 429 Too Many Requests and - before these limits existed - every
+  # rejected message was lost: the run went green and the chat stayed silent.
+  # The notifier now paces itself, honours `retry_after`, retries 5xx and falls
+  # back to plain text when the HTML entities are rejected, so an alert is
+  # delayed rather than dropped. Set min_interval_sec to 0 only when sending to a
+  # channel and living with the occasional 429.
+  min_interval_sec: 1.0
+  max_retries: 4           # attempts per message (429 / 5xx / connection errors)
+  retry_backoff_sec: 2.0   # base of the exponential backoff between attempts
+  max_wait_sec: 90.0       # total waiting budget for ONE message
+  mute_after_failure_sec: 60 # after a message runs out of retries, pause sends this
+                             # long (the pass must not burn hours waiting on Telegram;
+                             # deferred alerts are retried on the next pass)
   # MUST be false for the live scanner to actually send. `true` only prints
   # the messages to the log (use `scan --dry-run` for that instead; CI passes
   # --no-dry-run on real runs so this flag can never silently swallow alerts).

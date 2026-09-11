@@ -262,20 +262,30 @@ exempt here — a filtered symbol is not scanned at all, so nothing alerts on it
 
 The **Actions** tab includes two workflows:
 
-* **Scanner** — scheduled every 10 minutes across the NSE session
-  (09:15–15:30 IST = 03:45–10:00 UTC, Mon–Fri). **Each trigger starts one job
-  that scans the universe once and exits** (`python -m fpfssl scan` with the
-  shipped `scanner.exit_after_pass: true`; dispatch with `poll_session: true`
-  to get the previous session-long poller back), and the
-  `concurrency` group keeps a single scanner alive: a tick that fires while a
-  session job is running becomes the next queued run and takes over when the
-  job ends. That matters because GitHub's `schedule` is best-effort — ticks are
-  delayed 5–30 min under load and high-frequency ticks get dropped (a 5-minute
-  cron in this repo's history fired **once** where sixteen ticks were
-  expected), so a design that needs 96 ticks a day cannot work; a design where
-  **any single tick covers the whole session** does. Every such job always ends
-  on its own: at the close, at its `--max-runtime-minutes 325` budget (under the
-  350-minute job timeout), or a second after you press **Cancel workflow** — see
+* **Scanner** — scheduled every 15 minutes across the NSE session
+  (09:15–15:30 IST = 03:45–10:00 UTC, Mon–Fri) plus two late sweeps at
+  10:40/11:40 UTC. **One trigger starts the session worker**: `python -m fpfssl
+  scan` polls every `scanner.poll_minutes` until the close + `stop_after_close_minutes`
+  (`scanner.exit_after_pass: false`, the shipped default), so *any* tick that
+  arrives covers the rest of the session. Pass `once: true` to a dispatch (or set
+  `scanner.exit_after_pass: true`) for the cheaper "one pass per trigger" mode.
+  That matters because GitHub's `schedule` is best-effort: ticks are delayed
+  5–120 min under load and most of them are simply not delivered — on a session
+  day here it fired **2 times where ~80 were expected, both after the close**,
+  which is what "the scanner stopped alerting" actually was. Two layers now
+  remove the dependence:
+  1. the run itself is the session (not a 10-minute snapshot), and
+  2. if a session run is cut short while the market day is still live (runtime
+     budget, pass ceiling, feed stall), the scanner **dispatches exactly one
+     successor run** through the Actions API (`scanner.reschedule_in_ci`,
+     `fpfssl/ci.py`) — capped at `reschedule_max_runs_per_day`, never after a
+     cancel or a dry run. Set the repo Actions workflow permissions to *Read and
+     write* (the job asks for `actions: write`) so the re-arm can queue a run.
+  The `concurrency` group still keeps a single scanner alive: a tick that fires
+  while the session job runs becomes the queued successor and takes over when it
+  ends. Every such job ends on its own — at the close, at its
+  `--max-runtime-minutes 280` budget (under the 330-minute job timeout), or a
+  second after you press **Cancel workflow**; see
   [Stopping the scanner](#stopping-the-scanner-ctrl-c-cancel-runtime-budget).
   Add repository Actions
   secrets `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` for live alerts; scheduled
@@ -283,9 +293,14 @@ The **Actions** tab includes two workflows:
   can never silently swallow alerts again. Manual runs send for real by default
   (check *dry_run* to preview), and `symbols` / `interval` / `once` override the
   config. Live runs restore/save deduplication state using Actions cache; dry
-  runs never touch the live cache. Push runs only do an offline synthetic smoke
-  test. Every run appends a **diagnostics block** (per-symbol armed references,
-  feed lag, skip reasons) to its run summary.
+  runs never touch the live cache (and a `--dry-run` preview no longer writes the
+  state file at all, so a preview can never consume the alerts it previews). Push
+  runs only do an offline synthetic smoke test. Every run appends two blocks to
+  its run summary: the scanner's own **scan report** (`state/scan_report.json`:
+  universe scanned vs size-filtered vs no-data, alerts sent, dedup/cooldown
+  suppressions, Telegram delivery counters, why the run stopped, whether it
+  re-armed) and a **diagnostics** block (per-symbol armed references, feed lag,
+  skip reasons) — so a green run with no alert is never a mystery.
 * **Backtest** — choose **Run workflow** to select Yahoo or synthetic data,
   strategy, timeframe, optional symbols, and history bars (200–20000). Results
   appear in the run summary and a downloadable artifact containing the CSV/text
@@ -303,7 +318,7 @@ results are demo data, not real market performance.
 ## Stopping the scanner (one pass, Ctrl-C, cancel, runtime budget)
 
 `scan` (without `--once`) can be a long-lived poller, so it has to be
-**stoppable** — and by default it no longer needs to be: `scanner.exit_after_pass:
+**stoppable** — because a session worker holds a runner, `scanner.exit_after_pass:
 true` makes a run do ONE complete pass over the universe, save its dedup state and
 exit (`scanner stopped: scan complete (scanner.exit_after_pass)`). Set it to
 `false` (or pass `--keep-polling`) for the session-long poller described below:
@@ -312,9 +327,9 @@ exit (`scanner stopped: scan complete (scanner.exit_after_pass)`). Set it to
 | --- | --- |
 | **Ctrl-C** / **SIGINT** | The poller stops within a second — at the next symbol, or immediately out of its poll nap — saves the dedup state and exits (`scanner stopped: received SIGINT`). |
 | **`kill <pid>`** / **SIGTERM** (systemd stop, `timeout`, CI cancel) | Same graceful stop, so a cancelled run never re-announces its alerts later. |
-| **one pass then exit** (`scanner.exit_after_pass: true`, the shipped default) | The pass completes, dedup state is saved, the process exits. A scheduled CI run therefore ends with its scan instead of sitting in the runner until the close (with every later cron tick queued behind it in the `concurrency` group). |
-| **`--max-pass-minutes N`** (or `scanner.max_pass_minutes`) | Ceiling for a *single* pass (default `90`): a yahoo batch fetch that stalls past the ceiling is abandoned in a daemon thread — logged, state saved, run ends. This is the fix for "the scanner is stuck": a hung `yfinance` request used to be able to hold the pass (and the CI job) open indefinitely, because the polling loop only checked the clock *between* passes. |
-| **`--max-runtime-minutes N`** (or `scanner.max_runtime_minutes`) | Hard wall-clock budget: after N minutes it saves state and exits cleanly, even mid-session. `0` (default) = the market clock alone decides. The Actions workflow passes `325`, below its own job timeout. |
+| **one pass then exit** (`scanner.exit_after_pass: true`) | The pass completes, dedup state is saved, the process exits — the cheapest mode, and the right one when an external pinger (or the self re-arm) triggers a run every few minutes. The shipped config keeps it `false` so one tick covers the session. |
+| **`--max-pass-minutes N`** (or `scanner.max_pass_minutes`) | Ceiling for a *single* pass (default `90`): a yahoo batch fetch that stalls past the ceiling is abandoned in a daemon thread — logged, state saved, **this pass** skipped. The run keeps polling and retries on the next tick (only `scanner.max_pass_failures` consecutive data-less passes end it), and the *next* pass resumes at the symbol where the cut one stopped (`scanner.rotate_universe`). This is the fix for "the scanner is stuck": a hung `yfinance` request used to hold the pass (and the CI job) open indefinitely, because the polling loop only checked the clock *between* passes. |
+| **`--max-runtime-minutes N`** (or `scanner.max_runtime_minutes`, default `280`) | Hard wall-clock budget: after N minutes it saves state and exits cleanly, even mid-session — and then re-arms a successor for the rest of the session. `0` = the market clock alone decides. The Actions workflow passes `280`, below its own 330-minute job timeout. |
 | **Actions → Cancel workflow** | Cancels within a second. It used to be swallowed: a backgrounded process inherits SIGINT as `SIG_IGN` from the runner's non-interactive shell, so Python never installed its `KeyboardInterrupt` handler and the job ran for hours. The scanner now **installs its own SIGINT/SIGTERM handlers**, which overrides the inherited disposition. |
 | **Pause the schedule** | Set the repository variable `SCANNER_ENABLED=false` (Settings → Secrets and variables → Actions → Variables). Scheduled ticks then exit immediately; manual *Run workflow* still works. |
 | **session end** | Unchanged: the poller exits `stop_after_close_minutes` (15) past the 15:30 IST close, after the closing bar settles. |
@@ -429,6 +444,43 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `→ essl_tap @ … (price touched an eSSL level)` | the 💧 touch alert **is** firing on a recent bar |
 | `scan` exits: `Telegram is NOT configured` | a live run would drop everything, so it refuses to start (use `--dry-run` to preview) |
 
+**Every run also writes its own version of that answer**: `state/scan_report.json`
+(config: `scanner.report_file`), printed at the end of `scan` and published as the
+**Scanner run report** block of the Actions run summary. Read it top-down:
+
+| report field | what it rules out |
+|---|---|
+| `universe` / `scanned` / `filtered` | whether the run *reached* the symbols at all (0 here = the feed or the size filters, not the signals) |
+| `passes` / `failed_passes` | whether the market was actually scanned, or the feed produced no data (the poller retries; `max_pass_failures` ends it) |
+| `alerts sent` | whether there was anything to send — `0` with a healthy `scanned` means no signal fired inside `recent_bars` |
+| `suppressed: dedup / cooldown` | alerts *did* fire but were already delivered (with examples in `suppressed_examples`) |
+| `telegram: sent / throttled / failed` | delivery: `failed > 0` or `ready: false` means the chat never got what the scanner produced |
+| `stop_reason` / `re-armed` / `rearm_chain` | whether the session was covered to the close, or cut short and handed to a successor run |
+
+### Telegram delivery limits (why a flood of alerts used to arrive as silence)
+
+A full-universe pass raises dozens of taps in the same second; Telegram accepts
+roughly **one message per second per chat** and answers anything faster with
+`429 Too Many Requests`. The notifier used to fire every alert back-to-back and
+treat a rejected send as "not my problem" — the run went green, the chat stayed
+empty. It now paces itself and never loses a message on a retryable error:
+
+```yaml
+telegram:
+  min_interval_sec: 1.0   # spacing between two sends to this chat
+  max_retries: 4          # attempts per message (429 / 5xx / connection errors)
+  retry_backoff_sec: 2.0  # base of the exponential backoff
+  max_wait_sec: 90.0      # waiting budget for ONE message, then it is counted failed
+```
+
+`429` honours the `retry_after` Telegram reports, a rejected HTML entity re-sends
+the same text as escaped plain text (formatting is never worth a lost signal),
+over-long messages are trimmed on a tag boundary, and everything is counted in
+the report (`sent / throttled / failed / dropped`). A send that ultimately
+fails does **not** record its dedup key, so the next pass retries it — at-least-once
+delivery rather than a silent drop. `401`/`403`/`404` are reported once and not
+retried: that is a bot-token/chat-id problem, not a rate problem.
+
 The composite alert is deliberately strict (footprint TAP **and** eSSL tap on the
 *same* bar — the "ALL RULES" condition), so expect a *low* rate rather than a
 daily stream. Measured on the configured NSE universe (15m, 60 days of Yahoo
@@ -500,6 +552,7 @@ python tests/test_tap_filters.py        # 5 TAP #1 / fresh-OB filter tests
 python tests/test_essl_touch_alerts.py  # 10 eSSL level-touch alert tests
 python tests/test_universe.py           # full-NSE universe + batched-download tests
 python tests/test_size_filters.py       # 16 size-filter / stop-after-pass tests
+python tests/test_alert_delivery.py     # 21 Telegram delivery + session-coverage tests
 ```
 
 The first suite verifies the port bar-for-bar: the full
@@ -545,12 +598,14 @@ fpfssl/
   backtest.py           signal trading + statistics + CSV reports
   data.py               yahoo (daily/intraday) / csv / synthetic loaders
   synthetic.py          deterministic offline data generator
-  telegram.py           minimal Telegram HTTP notifier (dry-run capable)
+  telegram.py           Telegram HTTP notifier: pacing, 429 backoff, HTML fallback
+  ci.py                 self re-arm (one successor Actions run while the session lives)
   cli.py                `python -m fpfssl …` commands
 tests/test_engine.py        indicator-parity scenario tests
 tests/test_fidelity_live.py exact-match + live-NSE/intraday tests
 tests/test_live_scanner.py  offline end-to-end live-scanner (fake feed/clock) tests
 tests/test_size_filters.py  size filters (₹ crore / ₹ floors) + run-mode/ceiling tests
+tests/test_alert_delivery.py Telegram delivery limits, session coverage, run report
 data/                   CSV data (git-ignored); `sample-data` fills it synthetically
 state/                  scanner dedupe state (git-ignored)
 output/                 backtest reports (git-ignored)
