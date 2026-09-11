@@ -7,7 +7,9 @@ A bar-for-bar Python port of the Pine v6 indicator
 * a **live market scanner** over the **FULL NSE equity universe** (default: **daily TF**)
   that sends **Telegram alerts** whenever, in *any* watched stock, price **taps an eSSL
   level with all the remaining rules matched** (a confirmed footprint OB's source-TAP
-  condition fires on the same bar), plus defence / sweep / invalidation alerts;
+  condition fires on the same bar), **and** — enabled by default — whenever price simply
+  **touches an eSSL level** (💧 `essl_tap`: any active level, fresh or old, no footprint
+  TAP required), plus defence / sweep / invalidation alerts;
 * a **backtest engine** that trades exactly those signals (next-open entry, OB stop,
   R-multiple target, time exit) with full statistics;
 * a **report** command to inspect live zones, eSSL levels and FRESH lows at any time.
@@ -139,11 +141,38 @@ Action: source-compatible long reference at TAP. Stop below OB invalidation.
 The same bar may carry extra context (e.g. the tap is also a confirmed eSSL **sweep +
 reclaim** — a liquidity grab — which the message marks).
 
+### The 💧 eSSL level-touch alert (`essl_tap`) — enabled by default
+
+**Price touched an eSSL level → you get an alert**, on its own terms:
+
+* **any** active eSSL level, **fresh or old** — the only age limit is
+  `engine.essl_tap_max_age` (default 250 bars = the pool's own expiry, so in
+  practice every live level counts);
+* **with or without** a footprint TAP on that bar, and **first touch or repeat**;
+* **never** gated by `tap_first_only` / `fresh_ob_only` — those filters narrow the
+  footprint side only. A composite that they reject (TAP 2, or an OB older than
+  the fresh window) still produces its 💧 touch alert, and the message says why
+  the footprint side was filtered;
+* one alert **per level** when a bar touches several eSSL levels (the 60-minute
+  spam guard is per level, so they cannot mask each other);
+* the level a 🚨 composite already reported is **not** repeated as a bare touch.
+
+```
+💧 eSSL TAP — price touched the eSSL level
+📈 RELIANCE.NS (15m) 2026-09-10 10:00 • LIVE (intraday bar — provisional)
+
+💧 eSSL level 2,451.35 (EQL x2, age 191 bars, origin 2026-09-02 11:15)
+   tap low 2,449.80 | penetrated 1.55 below level
+   close 2,456.90 back above level → RECLAIMED ✅
+   ℹ️ eSSL level touch — fires on every touch of an active eSSL level (fresh or old, no footprint TAP required)
+```
+
 ### Other alerts (all in `scanner.alert_events`, toggle freely)
 
 | event | meaning |
 |---|---|
 | `essl_ob_tap` | 🚨 the composite above (primary) |
+| `essl_tap` | 💧 price touched an active eSSL level (fresh or old; footprint TAP not required) |
 | `essl_sweep` | eSSL penetration with close reclaim — liquidity grabbed at the external low |
 | `footprint_tap` | source-compatible TAP on any confirmed FP-OB (no eSSL coincidence required) |
 | `defence` | source defence confirmed after a TAP (bullish bar, CLV ≥ 0.65, RVOL ≥ 1.3, close > zone top, micro-BOS) |
@@ -153,7 +182,8 @@ reclaim** — a liquidity grab — which the message marks).
 ### TAP signal filters (TAP #1 + fresh OB only)
 
 `config.yaml` ships with the TAP stream narrowed to first touches of young zones —
-both the 🚨 composite and the standalone `footprint_tap` must pass these gates:
+both the 🚨 composite and the standalone `footprint_tap` must pass these gates
+(the 💧 `essl_tap` level-touch alert is **exempt**):
 
 ```yaml
 scanner:
@@ -164,9 +194,9 @@ scanner:
 
 Skipped taps are logged (`composite skipped — OB #7 age 132 bars > fresh window
 50`) so a quiet pass still explains itself. Set either toggle to `false` to
-restore the unfiltered stream. The default `alert_events` list is trimmed to
-`essl_ob_tap` + `footprint_tap` to match — add the muted events back to re-enable
-them.
+restore the unfiltered stream. The default `alert_events` list is
+`essl_ob_tap` + `essl_tap` + `footprint_tap` — add the muted events back to
+re-enable them.
 
 ---
 
@@ -298,10 +328,11 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `⛔ SKIPPED — feed lag …` | the market is open but the feed is `max_lag_minutes` behind |
 | `⛔ SKIPPED — only N bars < min_bars` | not enough history to warm the engine up |
 | `⏳ newest bar … is from a previous session` | pre-open/holiday: nothing new to alert yet (warm-up pass) |
-| `armed FP-OBs: none` | no confirmed footprint OB — the composite needs a TAP, so nothing can fire |
-| `armed eSSL: none` | no active eSSL level to tap (all breached/expired) |
+| `armed FP-OBs: none` | no confirmed footprint OB — the composite needs a TAP, so nothing can fire (the 💧 eSSL touch alert does **not** need one) |
+| `armed eSSL: none` | no active eSSL level to tap (all breached/expired) — neither the composite nor the 💧 touch alert can fire |
 | both armed, far away | the setup is live but price has not reached the references yet |
 | `→ essl_ob_tap @ …` | the composite **is** firing on a recent bar — check the Telegram credentials |
+| `→ essl_tap @ … (price touched an eSSL level)` | the 💧 touch alert **is** firing on a recent bar |
 | `scan` exits: `Telegram is NOT configured` | a live run would drop everything, so it refuses to start (use `--dry-run` to preview) |
 
 The composite alert is deliberately strict (footprint TAP **and** eSSL tap on the
@@ -310,9 +341,12 @@ daily stream. Measured on the configured NSE universe (15m, 60 days of Yahoo
 bars, ~1470 bars per symbol): 0–5 composite bars per symbol, i.e. roughly **one
 alert per symbol per month**, clustered when price sweeps an external low into
 an armed OB — plus `footprint_tap`/`essl_sweep`/`defence` events if you enable
-them (5–22 TAPs and 10–15 sweeps per symbol per 60 days). `diagnose` prints the
-exact rate for your universe:
-`alert rate: 2 composite bar(s) in 1471 bars (0.14%); last 2026-08-26 15:00`.
+them (5–22 TAPs and 10–15 sweeps per symbol per 60 days). The 💧 `essl_tap`
+level-touch alert is deliberately *not* rare — it fires on every touch of every
+active eSSL level, so expect it far more often than the composite (bounded by
+the per-level `alert_cooldown_minutes` guard). `diagnose` prints both counts for
+your universe:
+`alert rate: 2 composite bar(s) in 1471 bars (0.14%); last 2026-08-26 15:00 | 💧 eSSL level touched on 45 bar(s)`.
 
 ---
 
@@ -365,9 +399,11 @@ them only after testing. Full list with descriptions: see the comment block in
 ## Tests
 
 ```bash
-python tests/test_engine.py          # 9 indicator-parity scenarios (daily bars)
-python tests/test_fidelity_live.py   # 10 exact-match + live-NSE/intraday tests
-python tests/test_live_scanner.py    # 10 end-to-end live-scanner tests (offline feed)
+python tests/test_engine.py             # 9 indicator-parity scenarios (daily bars)
+python tests/test_fidelity_live.py      # 10 exact-match + live-NSE/intraday tests
+python tests/test_live_scanner.py       # 10 end-to-end live-scanner tests (offline feed)
+python tests/test_tap_filters.py        # 5 TAP #1 / fresh-OB filter tests
+python tests/test_essl_touch_alerts.py  # 9 eSSL level-touch alert tests
 ```
 
 The first suite verifies the port bar-for-bar: the full
@@ -382,6 +418,14 @@ The third drives the **whole live pipeline offline** (fake feed + fake IST clock
 `LiveScanner.scan_symbol` → alert text): the long-lived-zone regression above,
 LIVE vs confirmed tagging, dedup across passes, skip filters, session-clock
 helpers, the untrimmed history guarantee and the day-long `scan` loop.
+The fourth pins the TAP filters (TAP 2+ silent, old-OB TAP 1 silent, young-OB
+TAP 1 alerts).
+The fifth pins the 💧 **eSSL level-touch** alert: a touch with no footprint TAP
+alerts, an old (non-fresh) level still alerts, a composite rejected by the TAP
+filters still alerts its touch, a level the composite already reported is not
+duplicated, two levels on one bar both alert, muting `essl_tap` still silences
+it, and the engine taps an old level on the forming bar and the confirmed bar
+alike under one `essl_tap_max_age` rule.
 
 ## Project layout
 

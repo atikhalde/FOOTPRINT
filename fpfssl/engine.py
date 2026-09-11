@@ -648,7 +648,8 @@ class Engine:
                                          members=p.members, age_bars=age_bars,
                                          origin_date=dates[p.first_origin],
                                          classification=SSL_STATE_NAMES[final])
-                            if p.scope == 1 and l[t] <= p.lower + eps:
+                            if p.scope == 1 and l[t] <= p.lower + eps \
+                                    and t - p.born_bar <= cfg.essl_tap_max_age:
                                 emit(K_ESSL_TAP, t, pool_id=p.id, price=p.lower,
                                      low=l[t], close=c[t], penetrated=True,
                                      depth=max(p.lower - l[t], 0.0),
@@ -665,8 +666,12 @@ class Engine:
                             elif p.state == UNBREACHED:
                                 p.state = TOUCHED
                             # Group-8 event: EVERY overlap of an active eSSL is a
-                            # tap (touch / partial), not just the first latch.
-                            if p.scope == 1:
+                            # tap (touch / partial), not just the first latch —
+                            # fresh or old level alike (the only age limit is
+                            # `essl_tap_max_age`, applied identically on the
+                            # forming-bar path below, so a touch alerts the same
+                            # way live and once the bar is confirmed).
+                            if p.scope == 1 and t - p.born_bar <= cfg.essl_tap_max_age:
                                 partial = bool(l[t] < p.upper - eps)
                                 emit(K_ESSL_TAP, t, pool_id=p.id, price=p.lower,
                                      low=l[t], close=c[t], penetrated=partial,
@@ -1075,7 +1080,10 @@ class Engine:
                          reason=reason, close=c[t], stop=stop, taps=z.source_taps, state="OLD")
 
             # eSSL tap on the FORMING bar only (confirmed bars handled in (B)).
-            # Independent of zones: must run even when no zone is active.
+            # Independent of zones: must run even when no zone is active, and
+            # independent of freshness: any ACTIVE external level inside
+            # `essl_tap_max_age` (default 250 = the pool's own expiry, so in
+            # practice every live level) counts, exactly like the (B) path.
             if not confirmed and cfg.ssl_enabled:
                 for p in pools:
                     if p.active and p.scope == 1 and t > p.born_bar:

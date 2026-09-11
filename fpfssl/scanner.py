@@ -9,6 +9,11 @@ Flow per poll, per symbol:
   2. run the faithful engine over the whole history
   3. group events by bar; detect the composite ALL-RULES condition:
        eSSL tap  AND  footprint-source TAP  on the SAME bar
+     plus the standalone eSSL LEVEL TOUCH (`essl_tap`): price reached an active
+     eSSL level — fresh or old, with or without a footprint TAP that bar, and
+     never gated by tap_first_only / fresh_ob_only (those filter the footprint
+     side only). A composite that the TAP filters reject therefore still
+     produces its eSSL touch alert.
   4. dedupe against persisted state, apply cooldowns, format, send Telegram
 
 Dedup key: symbol | kind | bar-time | confirmed? | zone-or-pool-id
@@ -257,12 +262,20 @@ class LiveScanner:
             json.dump(self.state, fh)
 
     # -- alerting ------------------------------------------------------------
-    def _try_alert(self, sym: str, kind: str, message: str, dedup_key: str) -> bool:
+    def _try_alert(self, sym: str, kind: str, message: str, dedup_key: str,
+                   cooldown_key: str | None = None) -> bool:
+        """Send one alert unless it was already sent or is inside its cooldown.
+
+        `cooldown_key` defaults to `symbol|kind` (one stream per event type).
+        Callers pass a finer key when several *distinct objects* of the same
+        kind are alertable at once — e.g. two different eSSL levels touched on
+        the same bar — so one level's alert cannot swallow the other's.
+        """
         sc = self.cfg.scanner
         now = datetime.now()
         if dedup_key in self.state["alerted"]:
             return False
-        cd_key = f"{sym}|{kind}"
+        cd_key = cooldown_key or f"{sym}|{kind}"
         last = self.state["cooldown"].get(cd_key)
         if last:
             try:
@@ -374,21 +387,31 @@ class LiveScanner:
                 continue  # only the latest bars can be new to the user
             if session_open is not None and ev.date_dt < session_open:
                 continue  # previous session, even if still inside recent_bars
-            d = by_bar.setdefault(ev.date, {"tap": None, "essl": None, "other": []})
+            d = by_bar.setdefault(ev.date,
+                                  {"tap": None, "essl": None, "essl_all": [], "other": []})
             if ev.kind == K_TAP:
                 d["tap"] = ev  # latest tap on the bar
             elif ev.kind == K_ESSL_TAP:
-                d["essl"] = ev
+                d["essl"] = ev            # last touch = the composite's eSSL context
+                d["essl_all"].append(ev)  # every eSSL level touched on this bar
             else:
                 d["other"].append(ev)
 
         for date, d in sorted(by_bar.items()):
             composite_bar = d["tap"] is not None and d["essl"] is not None
+            # Set when the composite message went out (this pass or an earlier
+            # one): only that one eSSL level is skipped below, because its
+            # level is already inside that message. A composite *filtered out*
+            # by the TAP rules does NOT silence the eSSL touch — price did
+            # reach the level, so that still alerts.
+            composite_sent_pool = None
+            tap_filtered = ""  # why a footprint TAP on this bar stayed silent
             # composite: ALL RULES = eSSL tap + footprint tap on the same bar
             if "essl_ob_tap" in want and composite_bar:
                 tap, essl = d["tap"], d["essl"]
                 ok, reason = _tap_ok(tap)
                 if not ok:
+                    tap_filtered = reason
                     log.info("%s [%s] %s: 🚨 composite skipped — %s",
                              sym, tf, date, reason)
                 else:
@@ -396,8 +419,14 @@ class LiveScanner:
                     if not (provisional and not sc.provisional_alerts):
                         msg = format_composite(sym, tf, tap, essl)
                         key = f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|{tap.confirmed}|{tap.zone_id}|{essl.pool_id}"
+                        covered = key in self.state["alerted"]  # sent on an earlier pass
                         if self._try_alert(sym, "essl_ob_tap", msg, key):
                             sent += 1
+                            covered = True
+                        if covered:
+                            # the composite message already carries this level,
+                            # so the bare touch alert would only duplicate it
+                            composite_sent_pool = essl.pool_id
             # individual events
             singles = []
             if d["tap"] is not None and "footprint_tap" in want:
@@ -407,10 +436,28 @@ class LiveScanner:
                              sym, tf, date, reason)
                 else:
                     singles.append(("footprint_tap", d["tap"], d["tap"].zone_id))
-            # standalone eSSL tap (opt-in); suppressed when the composite fired
-            if d["essl"] is not None and "essl_tap" in want and not composite_bar:
-                ev = d["essl"]
-                singles.append(("essl_tap", ev, ev.pool_id))
+            # eSSL LEVEL TOUCH: alert whenever price reaches an active eSSL
+            # level — fresh or old, first touch or repeat, with or without a
+            # footprint TAP on the bar, and independent of tap_first_only /
+            # fresh_ob_only (those gate the footprint side only). Every level
+            # touched on the bar gets its own alert + its own cooldown, except
+            # the one a SENT composite already reported.
+            if "essl_tap" in want:
+                touched = []
+                for ev in d["essl_all"]:
+                    if ev.pool_id == composite_sent_pool:
+                        continue
+                    if not ev.confirmed and not sc.provisional_alerts:
+                        continue  # forming-bar touches stay silent (config)
+                    if tap_filtered:
+                        # explain in the message why this is a bare eSSL alert
+                        ev.extra["tap_filtered"] = tap_filtered
+                    singles.append(("essl_tap", ev, ev.pool_id))
+                    touched.append(ev)
+                if touched:
+                    log.info("%s [%s] %s: 💧 eSSL level touch on %d level(s)%s",
+                             sym, tf, date, len(touched),
+                             f" (footprint TAP filtered: {tap_filtered})" if tap_filtered else "")
             for ev in d["other"]:
                 mapping = {
                     K_DEFENCE: "defence",
@@ -427,7 +474,11 @@ class LiveScanner:
                     continue
                 msg = format_event(sym, tf, ev)
                 key = f"{sym}|{cfg.data.interval}|{kind}|{date}|{ev.confirmed}|{obj}"
-                if self._try_alert(sym, kind, msg, key):
+                # eSSL touches: one cooldown per LEVEL, so two levels tapped on
+                # the same bar cannot mask each other (all other kinds keep the
+                # single per-symbol+kind spam guard).
+                cd = f"{sym}|{kind}|{obj}" if kind == "essl_tap" else None
+                if self._try_alert(sym, kind, msg, key, cooldown_key=cd):
                     sent += 1
         return sent
 
