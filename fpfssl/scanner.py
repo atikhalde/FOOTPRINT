@@ -318,12 +318,17 @@ class LiveScanner:
         # A restarted scanner (fresh Actions runner, evicted dedup cache) would
         # otherwise re-announce the last `recent_bars` bars of a *previous*
         # session as if they were news. Intraday alerts must belong to the
-        # current session: the last bar has to carry today's date.
-        if cfg.data.source == "yahoo" and cfg.data.is_intraday() \
-                and pd.Timestamp(last_ts).date() != now_mkt.date():
-            log.info("%s: newest bar %s is from a previous session — warm-up only, "
-                     "nothing to alert yet", sym, last_ts)
-            return 0
+        # current session: the last bar has to carry today's date, and even
+        # then events whose stamp is before today's open are dropped (the
+        # first 09:15 print still has yesterday's 15:00/15:15 in a 3-bar
+        # window).
+        session_open = None
+        if cfg.data.source == "yahoo" and cfg.data.is_intraday():
+            if pd.Timestamp(last_ts).date() != now_mkt.date():
+                log.info("%s: newest bar %s is from a previous session — warm-up only, "
+                         "nothing to alert yet", sym, last_ts)
+                return 0
+            session_open, _ = _session_bounds(cfg, now_mkt)
         # NB: never cut the frame down to history_bars here. The engine's
         # footprint/TAP state machine is path-dependent — an OB born 600 bars
         # ago can be the TAP reference that fires today — so every bar the
@@ -349,6 +354,8 @@ class LiveScanner:
         for ev in res.events:
             if ev.bar < cutoff_bar:
                 continue  # only the latest bars can be new to the user
+            if session_open is not None and ev.date_dt < session_open:
+                continue  # previous session, even if still inside recent_bars
             d = by_bar.setdefault(ev.date, {"tap": None, "essl": None, "other": []})
             if ev.kind == K_TAP:
                 d["tap"] = ev  # latest tap on the bar
