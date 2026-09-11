@@ -350,6 +350,24 @@ class LiveScanner:
         want = set(sc.alert_events or [])
         sent = 0
         cutoff_bar = len(df) - max(1, int(sc.recent_bars or 3))
+        # TAP filters (tap_first_only / fresh_ob_only) need the tapped zone's
+        # birth bar to measure OB age: tap_bar - ob_born_bar.
+        zone_by_id = {z.id: z for z in res.zones}
+
+        def _tap_ok(tap_ev) -> tuple[bool, str]:
+            tap_no = tap_ev.extra.get("taps", 1)
+            if sc.tap_first_only and tap_no != 1:
+                return False, f"TAP {tap_no}/{tap_ev.extra.get('max_taps', '?')} (first-tap-only filter)"
+            if sc.fresh_ob_only:
+                zone = zone_by_id.get(tap_ev.zone_id)
+                if zone is None:
+                    return False, "tapped OB not found (fresh-OB-only filter)"
+                max_age = max(0, int(sc.fresh_ob_max_age_bars or 0))
+                age = tap_ev.bar - zone.born_bar
+                if age > max_age:
+                    return False, f"OB #{zone.id} age {age} bars > fresh window {max_age}"
+            return True, ""
+
         by_bar: dict[str, dict] = {}
         for ev in res.events:
             if ev.bar < cutoff_bar:
@@ -369,16 +387,26 @@ class LiveScanner:
             # composite: ALL RULES = eSSL tap + footprint tap on the same bar
             if "essl_ob_tap" in want and composite_bar:
                 tap, essl = d["tap"], d["essl"]
-                provisional = not tap.confirmed
-                if not (provisional and not sc.provisional_alerts):
-                    msg = format_composite(sym, tf, tap, essl)
-                    key = f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|{tap.confirmed}|{tap.zone_id}|{essl.pool_id}"
-                    if self._try_alert(sym, "essl_ob_tap", msg, key):
-                        sent += 1
+                ok, reason = _tap_ok(tap)
+                if not ok:
+                    log.info("%s [%s] %s: 🚨 composite skipped — %s",
+                             sym, tf, date, reason)
+                else:
+                    provisional = not tap.confirmed
+                    if not (provisional and not sc.provisional_alerts):
+                        msg = format_composite(sym, tf, tap, essl)
+                        key = f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|{tap.confirmed}|{tap.zone_id}|{essl.pool_id}"
+                        if self._try_alert(sym, "essl_ob_tap", msg, key):
+                            sent += 1
             # individual events
             singles = []
             if d["tap"] is not None and "footprint_tap" in want:
-                singles.append(("footprint_tap", d["tap"], d["tap"].zone_id))
+                ok, reason = _tap_ok(d["tap"])
+                if not ok:
+                    log.info("%s [%s] %s: footprint TAP skipped — %s",
+                             sym, tf, date, reason)
+                else:
+                    singles.append(("footprint_tap", d["tap"], d["tap"].zone_id))
             # standalone eSSL tap (opt-in); suppressed when the composite fired
             if d["essl"] is not None and "essl_tap" in want and not composite_bar:
                 ev = d["essl"]

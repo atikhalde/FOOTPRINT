@@ -60,16 +60,22 @@ scanner:
   market_open: "09:15"   # NSE equity open (IST)
   market_close: "15:30"  # NSE equity close (IST)
   recent_bars: 3         # only the last N bars can raise new alerts (daily + intraday)
+  # TAP signal filters (apply to essl_ob_tap composite + footprint_tap):
+  tap_first_only: true   # only TAP 1/N alerts; TAP 2/3/4 stay silent
+  fresh_ob_only: true    # only alert when the tapped OB itself is young
+  fresh_ob_max_age_bars: 50  # OB freshness window in bars of data.interval
+                         # (daily: 50 ≈ 2.5 months; intraday needs more, e.g. 500 for 15m)
   # Which events produce Telegram messages. essl_ob_tap is the composite:
   #   price TAPPED an eSSL level on a bar where a footprint-source TAP also
   #   fired = "price at eSSL level with ALL the remaining rules matched".
   alert_events:
-    - essl_ob_tap        # 🚨 composite — primary signal
-    - essl_sweep         # eSSL penetration + close reclaim (liquidity grab)
-    - footprint_tap      # source-compatible TAP on any confirmed FP-OB
-    - defence            # source defence confirmed after a TAP
-    - zone_invalid       # OB invalidated (stop) or touch limit exceeded
-    - essl_created       # new eSSL reference published (fresh major low)
+    - essl_ob_tap        # 🚨 composite — primary signal (TAP #1 + fresh OB only)
+    - footprint_tap      # source-compatible TAP #1 on a fresh FP-OB
+    # muted — TAP #1 / fresh-OB focus (add back to the list to re-enable):
+    # - essl_sweep       # eSSL penetration + close reclaim (liquidity grab)
+    # - defence          # source defence confirmed after a TAP
+    # - zone_invalid     # OB invalidated (stop) or touch limit exceeded
+    # - essl_created     # new eSSL reference published (fresh major low)
     # optional (off by default — add to the list to enable):
     # - essl_tap         # every standalone eSSL tap (no footprint TAP that bar)
     # - footprint_created# every newly confirmed FP-OB (TAP armed at its reference)

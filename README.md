@@ -150,6 +150,24 @@ reclaim** — a liquidity grab — which the message marks).
 | `zone_invalid` | OB invalidated (live close < fixed stop) or tap limit exceeded |
 | `essl_created` | a new eSSL reference was published (fresh major low) — a future tap target |
 
+### TAP signal filters (TAP #1 + fresh OB only)
+
+`config.yaml` ships with the TAP stream narrowed to first touches of young zones —
+both the 🚨 composite and the standalone `footprint_tap` must pass these gates:
+
+```yaml
+scanner:
+  tap_first_only: true       # only TAP 1/N alerts; TAP 2/3/4 stay silent
+  fresh_ob_only: true        # only alert when the tapped OB is young
+  fresh_ob_max_age_bars: 50  # OB age = tap_bar − ob_born_bar, in data.interval bars
+```
+
+Skipped taps are logged (`composite skipped — OB #7 age 132 bars > fresh window
+50`) so a quiet pass still explains itself. Set either toggle to `false` to
+restore the unfiltered stream. The default `alert_events` list is trimmed to
+`essl_ob_tap` + `footprint_tap` to match — add the muted events back to re-enable
+them.
+
 ---
 
 ## GitHub Actions: Scanner and Backtest
