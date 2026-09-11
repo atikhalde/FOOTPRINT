@@ -320,11 +320,21 @@ Everything above is ported 1:1 (verified by the hand-crafted scenario suite in
 
 1. **eSSL tap events** — the source has *no alerts*. The port emits `essl_tap`
    (touch / partial / full penetration, with the script's own penetration & reclaim
-   definitions), `essl_sweep`, and `essl_break` so the scanner can alert. An
-   `essl_tap` fires for **every** touch of **every** active external level — fresh
-   or old, first visit or repeat, on the forming bar and on confirmed bars alike.
-   The only age rule is `essl_tap_max_age`, applied identically on both paths
-   (default 250 = `ssl_max_age`, i.e. every live level counts).
+   definitions), `essl_sweep`, `essl_reclaim`, and `essl_break` so the scanner
+   can alert. An `essl_tap` fires for **every** touch of **every** active external
+   level — fresh or old, first visit or repeat, on the forming bar and on confirmed
+   bars alike. The only age rule is `essl_tap_max_age`, applied identically on both
+   paths (default 250 = `ssl_max_age`, i.e. every live level counts).
+
+   **Reclaim vs sweep labelling.** The engine's four reclaim-style states are kept
+   exactly as the source defines them (`SWEEP` / `GAP_RECLAIM` from **above**,
+   `RECOVERY` from **below**). The port's alert events split them: a wick **sweep
+   from above** emits `essl_sweep` and is labelled a *sweep* (close reclaimed the
+   level, but the level was never closed below — "not a fresh reclaim"); a genuine
+   **recovery from below** (prior close under the level, now back above) emits
+   `essl_reclaim` and is the **only** one labelled **RECLAIMED ✅**. A close below
+   the level emits `essl_break` ("NOT reclaimed"). So the alert only reads
+   RECLAIMED on a true from-below reclaim — never on an "old" wick reclaim.
 2. **The composite ALL-RULES signal** (`essl_ob_tap`): on one bar, an active
    eSSL level is tapped **and** a confirmed FP-OB's source-TAP condition fires —
    i.e. *price taps the eSSL level with all the remaining rules matched*. This is the

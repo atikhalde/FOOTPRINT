@@ -16,6 +16,7 @@ import pandas as pd
 from fpfssl.config import EngineConfig
 from fpfssl.engine import (
     CLUSTERED,
+    RECOVERY,
     SWEEP,
     Engine,
     Event,
@@ -23,12 +24,14 @@ from fpfssl.engine import (
 from fpfssl.events import (
     K_DEFENCE,
     K_ESSL_BREAK,
+    K_ESSL_RECLAIM,
     K_ESSL_SWEEP,
     K_ESSL_TAP,
     K_FOOTPRINT,
     K_SSL_CREATED,
     K_TAP,
     K_ZONE_INVALID,
+    format_event,
 )
 
 TICK = 0.01
@@ -240,10 +243,87 @@ def test_essl_pool_touch_and_sweep():
     assert sweeps[0].bar == 70
     assert sweeps[0].extra["reclaimed"] is True
     assert abs(sweeps[0].extra["depth"] - 0.15) < 1e-6
+    # a wick SWEEP FROM ABOVE is NOT a fresh (from-below) reclaim: it is labelled
+    # a sweep, never "RECLAIMED ✅".
+    assert sweeps[0].extra["reclaim_kind"] == "sweep"
+    sweep_msg = format_event("TEST", "Daily", sweeps[0])
+    assert "SWEEP" in sweep_msg and "RECLAIMED ✅" not in sweep_msg
 
     p = next(p for p in res.pools if p.id == pool_id)
     assert not p.active and p.state == SWEEP
     print("ok test_essl_pool_touch_and_sweep")
+
+
+# ---------------------------------------------------------------------------
+# Test 3b: genuine reclaim FROM BELOW (RECOVERY) — prior close under the level,
+# now back above — fires its own "RECLAIMED" alert and is the ONLY reclaim the
+# message labels RECLAIMED ✅. A wick SWEEP from above must NOT claim it.
+# ---------------------------------------------------------------------------
+def recovery_rows() -> list[tuple]:
+    rows = []
+    # bars 0..9: calm base ~100-102 (lowest will be the bar-10 pivot)
+    for o, c in [(100.0, 100.5), (100.5, 101.0), (101.0, 101.5), (101.5, 101.2),
+                 (101.2, 101.0), (101.0, 101.2), (101.2, 101.0), (101.0, 101.1),
+                 (101.1, 101.0), (101.0, 100.8)]:
+        rows.append((o, o + 1.0, o - 0.5, c, 1000.0))
+    # bar 10: major low pivot at 95.0 (lowest across [0,20])
+    rows.append((100.8, 101.0, 95.0, 95.5, 1000.0))
+    # bars 11..20: rally so bar 10 stays the lowest in [0,20]
+    rise = [96.4, 97.0, 97.8, 98.6, 99.4, 100.2, 101.0, 101.8, 102.6, 103.4]
+    for i, c in enumerate(rise):
+        lo = c - 0.4
+        rows.append((c - 1.0, c + 1.0, lo, c, 1000.0))
+    # bars 21..24: continue rising toward the bar-25 major-high pivot (112)
+    for c in [104.2, 105.0, 105.8, 106.6]:
+        rows.append((c - 1.0, c + 1.0, c - 0.4, c, 1000.0))
+    # bar 25: major high pivot at 112.0 (highest across [15,35])
+    rows.append((106.6, 112.0, 106.2, 111.5, 1000.0))
+    # bars 26..35: decline so bar 25 stays the highest in [15,35]
+    fall = [110.4, 109.4, 108.4, 107.4, 106.4, 105.4, 104.4, 103.4, 102.4, 101.4]
+    for c in fall:
+        rows.append((c + 1.0, c + 1.4, c - 0.4, c, 1000.0))
+    # at bar 35 both pivots are confirmed -> external range ready -> eSSL pool
+    # at 95.0 is published (born_bar 35). Drift down toward the level (every
+    # bar stays comfortably ABOVE 95 so the pool is never penetrated early).
+    drift = [100.6, 99.6, 98.6, 97.6, 96.8, 96.0]
+    for i, c in enumerate(drift):
+        lo = c - 0.4
+        rows.append((c + 0.4, c + 0.8, lo, c, 1000.0))
+    # bar 42: low 95.4 (no penetration), close 95.8
+    rows.append((96.0, 96.4, 95.4, 95.8, 1000.0))
+    # bar 43: close dips below 95 but does NOT fully penetrate (low 95.05 > 94.99)
+    rows.append((95.5, 95.9, 95.05, 94.8, 1000.0))
+    # bar 44: prior close 94.8 (below level) -> full penetration + close reclaim
+    #         above -> RECOVERY (genuine from-below reclaim)
+    rows.append((94.9, 95.0, 94.8, 96.0, 1000.0))
+    return rows
+
+
+def test_essl_recovery_emits_reclaim():
+    res = run(recovery_rows())
+    created = [e for e in evs(res, K_SSL_CREATED) if abs(e.price - 95.0) < 1e-9]
+    assert created, "eSSL pool at 95.0 was never published"
+    pool_id = created[0].pool_id
+    assert created[0].bar == 35, (created[0].bar, created[0].extra)
+
+    reclaims = [e for e in evs(res, K_ESSL_RECLAIM) if e.pool_id == pool_id]
+    assert len(reclaims) == 1, [(e.bar, e.extra) for e in reclaims]
+    r = reclaims[0]
+    assert r.bar == 44
+    assert r.extra["reclaimed"] is True
+    assert r.extra["reclaim_kind"] == "recovery"
+    assert r.extra["classification"] == "Recovered from below"
+    # a from-below recovery is the ONLY reclaim labelled RECLAIMED ✅
+    msg = format_event("TEST", "Daily", r)
+    assert "RECLAIMED ✅" in msg and "reclaimed from below" in msg
+    assert "SWEEP" not in msg
+    # and it must NOT also raise a SWEEP on the same bar
+    assert not any(e.bar == 44 and e.pool_id == pool_id
+                   for e in evs(res, K_ESSL_SWEEP)), "RECOVERY must not also emit a SWEEP"
+
+    p = next(p for p in res.pools if p.id == pool_id)
+    assert not p.active and p.state == RECOVERY
+    print("ok test_essl_recovery_emits_reclaim")
 
 
 def test_essl_break():
@@ -539,6 +619,7 @@ ALL = [
     test_backtest_default_config,
     test_full_chain,
     test_essl_pool_touch_and_sweep,
+    test_essl_recovery_emits_reclaim,
     test_essl_break,
     test_essl_eql_clustering,
     test_synthetic_invariants,

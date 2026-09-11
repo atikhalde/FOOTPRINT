@@ -35,6 +35,7 @@ from .events import (
     K_APPROACH,
     K_DEFENCE,
     K_ESSL_BREAK,
+    K_ESSL_RECLAIM,
     K_ESSL_SWEEP,
     K_ESSL_TAP,
     K_FRESH_ESSL,
@@ -624,6 +625,8 @@ class Engine:
                                 final = CLOSED_BELOW
                             age_bars = t - p.born_bar
                             # Pine counts reclaims/recoveries/breaks for BOTH scopes.
+                            reclaim_kind = ("gap_reclaim" if final == GAP_RECLAIM
+                                            else "sweep" if final == SWEEP else None)
                             if final in (SWEEP, GAP_RECLAIM):
                                 self._ssl_events.append({
                                     "bar": t, "scope": p.scope, "state": final,
@@ -634,11 +637,24 @@ class Engine:
                                     emit(K_ESSL_SWEEP, t, pool_id=p.id, price=p.lower,
                                          low=l[t], close=c[t], penetrated=True,
                                          depth=p.lower - l[t], reclaimed=True,
+                                         reclaim_kind=reclaim_kind,
                                          members=p.members, age_bars=age_bars,
                                          origin_date=dates[p.first_origin],
                                          classification=SSL_STATE_NAMES[final])
                             elif final == RECOVERY:
+                                # genuine reclaim FROM BELOW: the prior bar closed
+                                # under the level and this bar reclaimed it. This is
+                                # the only "fresh" reclaim the alert labels RECLAIMED;
+                                # a wick SWEEP from above is NOT counted as one.
                                 counters["ssl_recoveries"] = counters.get("ssl_recoveries", 0) + 1
+                                if p.scope == 1:
+                                    emit(K_ESSL_RECLAIM, t, pool_id=p.id, price=p.lower,
+                                         low=l[t], close=c[t], penetrated=True,
+                                         depth=p.lower - l[t], reclaimed=True,
+                                         reclaim_kind="recovery",
+                                         members=p.members, age_bars=age_bars,
+                                         origin_date=dates[p.first_origin],
+                                         classification=SSL_STATE_NAMES[final])
                             else:
                                 counters["ssl_breaks"] = counters.get("ssl_breaks", 0) + 1
                                 if p.scope == 1:
@@ -1106,6 +1122,7 @@ class Engine:
             "defence": sum(1 for e in events if e.kind == K_DEFENCE),
             "essl_taps": sum(1 for e in events if e.kind == K_ESSL_TAP),
             "essl_sweeps": sum(1 for e in events if e.kind == K_ESSL_SWEEP),
+            "essl_reclaims": sum(1 for e in events if e.kind == K_ESSL_RECLAIM),
             "essl_breaks": sum(1 for e in events if e.kind == K_ESSL_BREAK),
             "pools_created": next_pool_id - 1,
             "zones_created": len(zones),
