@@ -33,7 +33,9 @@ from fpfssl.synthetic import generate_intraday
 import fpfssl.scanner as scanner
 
 SESS_DAYS = 60            # 1500 15m bars
-SEED = 45                 # composite at bar 825, zone born at bar 140 (age 685)
+SEED = 40                 # composite at bar 634 (swept+reclaimed eSSL 264.8,
+                          # zone born at bar 99, age 535); bar 785 closes below
+                          # three eSSL levels = the BREAK bar (never a touch)
 SYM = "RELIANCE.NS"
 # Pin the synthetic calendar. generate_intraday defaults to Timestamp.today(),
 # so a hardcoded "next morning" would silently become *the same session* every

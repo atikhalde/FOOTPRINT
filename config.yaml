@@ -76,6 +76,11 @@ scanner:
   # Which events produce Telegram messages. essl_ob_tap is the composite:
   #   price TAPPED an eSSL level on a bar where a footprint-source TAP also
   #   fired = "price at eSSL level with ALL the remaining rules matched".
+  # eSSL taps are touches of a level that is STILL ACTIVE when the bar ends —
+  # exactly the levels the indicator draws. A bar that closes back above after
+  # tapping (sweep + reclaim) is a valid tap; a bar that closes BELOW the level
+  # retires it in the indicator (first full penetration is terminal) and is
+  # reported — if at all — as essl_break, never as a touch.
   alert_events:
     - essl_ob_tap        # 🚨 composite — primary signal (TAP #1 + fresh OB only)
     - essl_tap           # 💧 price TOUCHED an eSSL level — every active level, fresh or old,
@@ -84,6 +89,8 @@ scanner:
     - footprint_tap      # source-compatible TAP #1 on a fresh FP-OB
     # muted — TAP #1 / fresh-OB focus (add back to the list to re-enable):
     # - essl_sweep       # eSSL penetration + close reclaim (liquidity grab)
+    # - essl_break       # ⚠️ eSSL closed below — the level is retired (this is
+    #                    #    what a "NOT reclaimed" tap bar really is)
     # - defence          # source defence confirmed after a TAP
     # - zone_invalid     # OB invalidated (stop) or touch limit exceeded
     # - essl_created     # new eSSL reference published (fresh major low)

@@ -157,6 +157,15 @@ reclaim** — a liquidity grab — which the message marks).
   spam guard is per level, so they cannot mask each other);
 * the level a 🚨 composite already reported is **not** repeated as a bare touch.
 
+"Active" is exactly the indicator's own state. A bar may poke ≥ 1 tick below the
+level and close back above it — that is a **sweep-and-reclaim**, the level held,
+and it alerts as a touch (`RECLAIMED ✅`). A bar that **closes below the level**
+is the indicator's *first full penetration is terminal* rule: the level is
+retired at that very close, so it is no longer a touchable level when the
+alert's bar ends. That outcome is a ⚠️ `essl_break` (enable it in
+`alert_events`), never a 💧 touch — a bar still forming below the level waits
+for the close instead of alerting mid-break.
+
 ```
 💧 eSSL TAP — price touched the eSSL level
 📈 RELIANCE.NS (15m) 2026-09-10 10:00 • LIVE (intraday bar — provisional)
@@ -174,6 +183,7 @@ reclaim** — a liquidity grab — which the message marks).
 | `essl_ob_tap` | 🚨 the composite above (primary) |
 | `essl_tap` | 💧 price touched an active eSSL level (fresh or old; footprint TAP not required) |
 | `essl_sweep` | eSSL penetration with close reclaim — liquidity grabbed at the external low |
+| `essl_break` | ⚠️ eSSL closed below (no reclaim) — the indicator retires the level at that close |
 | `footprint_tap` | source-compatible TAP on any confirmed FP-OB (no eSSL coincidence required) |
 | `defence` | source defence confirmed after a TAP (bullish bar, CLV ≥ 0.65, RVOL ≥ 1.3, close > zone top, micro-BOS) |
 | `zone_invalid` | OB invalidated (live close < fixed stop) or tap limit exceeded |
@@ -419,11 +429,11 @@ them only after testing. Full list with descriptions: see the comment block in
 ## Tests
 
 ```bash
-python tests/test_engine.py             # 9 indicator-parity scenarios (daily bars)
+python tests/test_engine.py             # 10 indicator-parity scenarios (daily bars)
 python tests/test_fidelity_live.py      # 10 exact-match + live-NSE/intraday tests
 python tests/test_live_scanner.py       # 10 end-to-end live-scanner tests (offline feed)
 python tests/test_tap_filters.py        # 5 TAP #1 / fresh-OB filter tests
-python tests/test_essl_touch_alerts.py  # 9 eSSL level-touch alert tests
+python tests/test_essl_touch_alerts.py  # 10 eSSL level-touch alert tests
 ```
 
 The first suite verifies the port bar-for-bar: the full
