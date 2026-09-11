@@ -307,9 +307,9 @@ class LiveScanner:
     def _size_tail(self, sym: str, price: float) -> str:
         """Size footer for an alert (empty when the filters are off).
 
-        Every alert states the stock it cleared: ₹1,432 price / ₹9,50,000 Cr
-        market cap, plus the thresholds in force — so a message is verifiable
-        against config.yaml without re-running `diagnose`.
+        Every alert states the stock it cleared (₹1,432 price / ₹945,000 Cr
+        market cap, say) plus the thresholds in force, so a message can be
+        verified against config.yaml without re-running `diagnose`.
         """
         if not self.filters.enabled:
             return ""

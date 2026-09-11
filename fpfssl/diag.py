@@ -388,11 +388,14 @@ def run_diag(cfg: AppConfig, symbols: list[str] | None = None,
                 px = _price(s)
                 return (-(flt.market_cap_cr(s, px, table) or 0.0), -px)
             kept = [s for s in syms if flt.check(s, _price(s), table)[0]]
-            rest = [s for s in syms if s not in set(kept)]
-            order = sorted(kept, key=_rank)[:cap] + sorted(kept, key=_rank)[cap:] + rest
+            seen = set(kept)
+            verdict_only = [s for s in syms if s not in seen]   # filtered: no engine
+            ranked = sorted(kept, key=_rank)
+            order = ranked[:cap] + verdict_only
+            tail = ranked[cap:]
             log.info("diagnose: engine work capped to the %d biggest symbols that pass "
-                     "the size filters (of %d kept, %d total)", min(cap, len(kept)),
-                     len(kept), len(syms))
+                     "the size filters (%d kept, %d filtered out, %d total)",
+                     min(cap, len(ranked)), len(ranked), len(verdict_only), len(syms))
         else:
             order, tail = syms[:cap], syms[cap:]
             log.info("diagnose: engine work capped to the first %d of %d symbols", cap, len(syms))

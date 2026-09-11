@@ -12,7 +12,8 @@ Covers `scanner.min_market_cap_cr` / `scanner.min_price` /
   6. the share-count cache round-trips and drives `prime()` (only missing
      symbols are fetched, results are saved)
   7. market cap = shares x last close in ₹ crore
-  8. `diagnose` states the same verdict (status "filtered") without running the engine
+  8. `diagnose` states the same verdict (status "filtered") without running the
+     engine, and `--max-symbols` bounds the engine work to the biggest names
   9. `exit_after_pass: true` -> one pass, then the run ends (was: poll to close)
  10. `max_pass_minutes` -> a stalled feed cannot hang the pass (or the process)
 
@@ -300,6 +301,27 @@ def test_diagnose_reports_the_verdict_instead_of_the_engine():
     print(f"ok test_diagnose_reports_the_verdict_instead_of_the_engine ({d.skip_reason})")
 
 
+def test_diagnose_cap_runs_the_engine_on_the_biggest_names_only():
+    """`--max-symbols` bounds the expensive part and keeps the verdicts."""
+    from fpfssl import diag as DIAG
+    prices = {"BIG.NS": 900.0, "MID.NS": 400.0, "SMALL.NS": 120.0}
+    frames = {s: make_df([(p, p * 1.01, p * 0.99, p, 1000.0)] * 60)
+              for s, p in prices.items()}
+    orig = DIAG.load_all
+    DIAG.load_all = lambda syms, d: frames
+    try:
+        cfg = mk_cfg(min_price=0.0, min_market_cap_cr=0.0)
+        now = pd.Timestamp(frames["MID.NS"].index[-1]).to_pydatetime().replace(hour=17)
+        diags = DIAG.run_diag(cfg, list(prices), now=now, max_symbols=1)
+    finally:
+        DIAG.load_all = orig
+    assert diags[0].symbol == "BIG.NS", [d.symbol for d in diags]
+    assert diags[0].counters, "the ranked symbol must get a real engine pass"
+    assert {d.symbol: d.status for d in diags[1:]} == {"MID.NS": "capped",
+                                                        "SMALL.NS": "capped"}, diags
+    print("ok test_diagnose_cap_runs_the_engine_on_the_biggest_names_only")
+
+
 # ---------------------------------------------------------------------------
 # 8. stop after a pass
 # ---------------------------------------------------------------------------
@@ -400,6 +422,7 @@ ALL = [
     test_cache_roundtrip_and_prime_only_fetches_missing,
     test_non_inr_and_broken_prices_are_no_verdict,
     test_diagnose_reports_the_verdict_instead_of_the_engine,
+    test_diagnose_cap_runs_the_engine_on_the_biggest_names_only,
     test_filters_describe_and_disabled,
     test_exit_after_pass_ends_the_run,
     test_max_pass_minutes_abandons_a_stalled_fetch,

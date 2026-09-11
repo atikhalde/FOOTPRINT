@@ -499,7 +499,7 @@ python tests/test_live_scanner.py       # 10 end-to-end live-scanner tests (offl
 python tests/test_tap_filters.py        # 5 TAP #1 / fresh-OB filter tests
 python tests/test_essl_touch_alerts.py  # 10 eSSL level-touch alert tests
 python tests/test_universe.py           # full-NSE universe + batched-download tests
-python tests/test_size_filters.py       # 15 size-filter / stop-after-pass tests
+python tests/test_size_filters.py       # 16 size-filter / stop-after-pass tests
 ```
 
 The first suite verifies the port bar-for-bar: the full
