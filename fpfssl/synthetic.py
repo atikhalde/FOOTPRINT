@@ -117,19 +117,23 @@ def session_index(days: int, minutes: int = 15, end: pd.Timestamp | None = None)
 
 
 def generate_intraday(symbol: str, cfg: DataConfig, days: int | None = None,
-                      minutes: int = 15, seed: int | None = None) -> pd.DataFrame:
+                      minutes: int = 15, seed: int | None = None,
+                      end: pd.Timestamp | None = None) -> pd.DataFrame:
     """Deterministic intraday OHLCV ending at the last completed session.
 
     Tick-rounded (0.05 for .NS/.BO), volume clustered and spiked so the
     evidence/RVOL and pivot machinery both fire, with enough range to create
     footprint OBs and eSSL pools — i.e. the same feature mix the live scanner
     sees, without touching the network.
+
+    `end` pins the last session date (tests must pass one — otherwise bar
+    timestamps drift every calendar day and session-clock assertions break).
     """
     tick = _ticks(symbol)
     if minutes not in (1, 2, 5, 15, 30, 60):
         minutes = 15
     days = int(days or max(10, cfg.history_bars // int(375 / minutes) + 1))
-    idx = session_index(days, minutes)
+    idx = session_index(days, minutes, end=end)
     n = len(idx)
     s = (SEED_BASE + int(zlib.crc32(symbol.encode("utf-8")) % 100_000)
          if seed is None else int(seed))

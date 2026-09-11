@@ -35,6 +35,28 @@ import fpfssl.scanner as scanner
 SESS_DAYS = 60            # 1500 15m bars
 SEED = 45                 # composite at bar 825, zone born at bar 140 (age 685)
 SYM = "RELIANCE.NS"
+# Pin the synthetic calendar. generate_intraday defaults to Timestamp.today(),
+# so a hardcoded "next morning" would silently become *the same session* every
+# weekday the suite rolls forward (the 2026-09-11 failure of
+# test_no_alerts_for_previous_session_bars).
+FIXED_END = pd.Timestamp("2026-09-10")
+
+_ORIG_LOAD = scanner.load_symbol
+_ORIG_NOW = scanner.market_now
+
+
+def _restore_scanner():
+    scanner.load_symbol = _ORIG_LOAD
+    scanner.market_now = _ORIG_NOW
+
+
+def gen_intraday(**kw):
+    """Offline 15m frame with a pinned last session (calendar-stable)."""
+    days = kw.pop("days", SESS_DAYS)
+    seed = kw.pop("seed", SEED)
+    end = kw.pop("end", FIXED_END)
+    cfg = kw.pop("cfg", None) or DataConfig(interval="15m", history_bars=600)
+    return generate_intraday(SYM, cfg, days=days, seed=seed, end=end, **kw)
 
 
 # ---------------------------------------------------------------------------
@@ -100,18 +122,27 @@ def mk_cfg() -> AppConfig:
 
 def scanner_with(cfg: AppConfig, frame: pd.DataFrame, now: datetime, notifier=None):
     """A LiveScanner wired to an in-memory feed and clock."""
+    _restore_scanner()
     sc = scanner.LiveScanner(cfg, notifier or Recorder(), symbols=[SYM])
     scanner.load_symbol = lambda sym, d: frame
     scanner.market_now = lambda c: now
     return sc
 
 
+def next_session_morning(bar_time) -> datetime:
+    """09:16 IST on the next weekday after `bar_time` (before that session's first print)."""
+    t = pd.Timestamp(bar_time).to_pydatetime()
+    now = t.replace(hour=9, minute=16, second=0, microsecond=0) + timedelta(days=1)
+    while now.weekday() >= 5:
+        now += timedelta(days=1)
+    return now
+
+
 # ---------------------------------------------------------------------------
 # 1. THE regression test: a zone born > 500 bars ago still alerts
 # ---------------------------------------------------------------------------
 def test_live_alert_long_lived_zone():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday()
     bars = composite_bars(df)
     assert bars, "generator/engine no longer produce a composite bar for this seed"
     k = bars[0]
@@ -151,8 +182,7 @@ def test_live_alert_long_lived_zone():
 # 2. Same bar, but closed: the follow-up alert is tagged confirmed
 # ---------------------------------------------------------------------------
 def test_live_alert_confirmed_after_bar_close():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday()
     k = composite_bars(df)[0]
     cfg = mk_cfg()
     frame = df.iloc[:k + 1]
@@ -173,8 +203,7 @@ def test_live_alert_confirmed_after_bar_close():
 # 3. Dedup: the same pass twice sends one message; a later pass re-sends nothing
 # ---------------------------------------------------------------------------
 def test_alert_dedup_across_passes():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday()
     k = composite_bars(df)[0]
     cfg = mk_cfg()
     frame = df.iloc[:k + 1]
@@ -196,8 +225,7 @@ def test_alert_dedup_across_passes():
 # 4. Scanner filters still skip what they should (and say why)
 # ---------------------------------------------------------------------------
 def test_skips_stale_and_short_history():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday()
     cfg = mk_cfg()
 
     # stale: last bar two weeks old
@@ -227,19 +255,38 @@ def test_skips_stale_and_short_history():
 # 4b. A restarted scanner must not re-announce a previous session's bars
 # ---------------------------------------------------------------------------
 def test_no_alerts_for_previous_session_bars():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday()
     k = composite_bars(df)[0]
     cfg = mk_cfg()
-    frame = df.iloc[:k + 1]                     # frame ends 2026-08-05 09:15
+    frame = df.iloc[:k + 1]
     rec = Recorder()
-    # next morning, before the first bar of the new session prints
-    now = datetime(2026, 8, 6, 9, 16)
+    # next weekday morning, before the first bar of the new session prints.
+    # Must be derived from the composite stamp — a hardcoded date becomes the
+    # *same* session the moment generate_intraday's calendar rolls forward.
+    now = next_session_morning(df.index[k])
+    assert now.date() != pd.Timestamp(df.index[k]).date()
     sc = scanner_with(cfg, frame, now, rec)
     assert sc.scan_symbol(SYM) == 0, rec.kinds
     # ... and the same frame during its own session *does* alert
     sc2 = scanner_with(mk_cfg(), frame, (df.index[k] + timedelta(minutes=5)).to_pydatetime(), Recorder())
     assert sc2.scan_symbol(SYM) >= 1
+
+    # Restart after today's 09:15 has printed: yesterday's last bars still sit
+    # inside `recent_bars`, but must not be re-announced.
+    comp_date = pd.Timestamp(df.index[k]).date()
+    j = k + 1
+    while j < len(df) and pd.Timestamp(df.index[j]).date() == comp_date:
+        j += 1
+    assert j < len(df), "fixture needs a following session"
+    mixed_cfg = mk_cfg()
+    mixed_cfg.scanner.recent_bars = max(3, j - k + 1)  # keep the composite in-window
+    rec_m = Recorder()
+    sc_m = scanner_with(mixed_cfg, df.iloc[:j + 1],
+                        (df.index[j] + timedelta(minutes=5)).to_pydatetime(), rec_m)
+    sc_m.scan_symbol(SYM)
+    stamp = df.index[k].strftime("%Y-%m-%d %H:%M")
+    leaked = [m for m in rec_m.messages if stamp in m]
+    assert not leaked, f"previous-session composite re-announced after today's open: {leaked}"
     print("ok test_no_alerts_for_previous_session_bars")
 
 
@@ -247,8 +294,7 @@ def test_no_alerts_for_previous_session_bars():
 # 5. The data layer must not trim history unless asked
 # ---------------------------------------------------------------------------
 def test_history_is_not_trimmed():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=200),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday(cfg=DataConfig(interval="15m", history_bars=200))
     cfg = DataConfig(source="yahoo", interval="15m", history_bars=200)
     assert len(_cap(df, cfg)) == len(df), "history was cut to history_bars"
     cfg.max_bars = 300
@@ -278,8 +324,7 @@ def test_session_clock_helpers():
 # 7. `watch_lines` explains an armed (or empty) scan pass
 # ---------------------------------------------------------------------------
 def test_watch_lines_report_armed_references():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=600),
-                           days=SESS_DAYS, seed=SEED)
+    df = gen_intraday()
     cfg = mk_cfg()
     k = composite_bars(df)[0]
     cfg.scanner.min_bars = 50
@@ -299,7 +344,7 @@ def test_watch_lines_report_armed_references():
 # 8. Intraday synthetic bars look like a real session feed
 # ---------------------------------------------------------------------------
 def test_generate_intraday_sessions():
-    df = generate_intraday(SYM, DataConfig(interval="15m", history_bars=100), days=5, seed=7)
+    df = gen_intraday(cfg=DataConfig(interval="15m", history_bars=100), days=5, seed=7)
     per_day = df.groupby(df.index.date).size()
     assert set(per_day.unique()) == {25}, per_day.to_dict()
     assert all(t.hour == 9 and t.minute == 15 for t in
@@ -336,6 +381,7 @@ def test_run_forever_covers_the_session():
         sc.run_forever()
     finally:
         _time.sleep = real_sleep
+        _restore_scanner()
     assert passes["n"] > 20, f"too few passes over the session: {passes['n']}"
     assert clock["t"].hour == 15 and clock["t"].minute >= 30, clock["t"]
     assert scanner._session_finished(cfg, clock["t"])
@@ -370,6 +416,8 @@ def main():
             import traceback
             traceback.print_exc()
             print(f"ERROR {t.__name__}: {e}")
+        finally:
+            _restore_scanner()
     if failed:
         sys.exit(1)
     print(f"\nAll {len(ALL)} live-scanner tests passed.")
