@@ -50,7 +50,10 @@ scanner:
   poll_minutes: 15       # daily polling cadence (intraday TFs can poll faster)
   state_file: state/scanner_state.json
   provisional_alerts: true   # alert on the still-forming bar too (marked LIVE), then again when confirmed
-  alert_cooldown_minutes: 60 # per symbol+event-type spam guard
+                             # (the close-confirmed follow-up of the SAME bar is exempt from the
+                             # cooldown below — on a daily bar it always lands inside the window, and
+                             # it is the state the indicator shows at the close, e.g. RECLAIMED ✅)
+  alert_cooldown_minutes: 60 # per symbol+event-type spam guard (across different bars)
   min_bars: 600          # skip symbols with less history (ATR/MA/pivot/SSL/pool warmup)
   stop_after_close_minutes: 15   # keep polling this long past 15:30 IST for the closing bar
   preopen_wait_minutes: 60       # started earlier than this before the open -> single pass, exit

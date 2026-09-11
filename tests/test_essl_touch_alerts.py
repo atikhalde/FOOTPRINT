@@ -20,6 +20,10 @@ exactly match the indicator"*:
  10. a bar that closes BELOW the level is a BREAK (the indicator retires the
      level at that close): it never alerts as a touch — the FMGOETZE 445.65
      "NOT reclaimed" alert cannot happen again
+ 11. the OTHER half of that incident: the sweep-and-reclaim of the still-active
+     432.65 alerts as 💧 RECLAIMED ✅ on the forming bar AND as the
+     close-confirmed alert (the 60-min per-level cooldown must not swallow it),
+     while ⚠️ `essl_break` stays wired for the retired level
 
 Run:  .venv/bin/python tests/test_essl_touch_alerts.py     (or via pytest)
 """
@@ -254,9 +258,13 @@ def test_touch_alert_can_be_muted():
 
 # ---------------------------------------------------------------------------
 # 6b. Forming bar alerts LIVE; the confirmed version has its own dedup key and
-#     goes out as soon as the per-level cooldown allows (a 15m bar closes 15
-#     min later, so the shipped 60-min guard normally still covers it — one
-#     alert per touch, which is the point of the spam guard).
+#     is the close-confirmed counterpart of THAT SAME bar, so it always goes
+#     out — `provisional_alerts` promises "alert on the still-forming bar too,
+#     then again when confirmed", and on a DAILY bar the confirming pass always
+#     lands inside `alert_cooldown_minutes` of the last intraday poll (letting
+#     the guard eat it is what silenced the FMGOETZE close alert). Every later
+#     pass for the same bar stays silent, so a touch is still at most two
+#     messages: the guess and the verdict, never a stream.
 # ---------------------------------------------------------------------------
 def _two_pass_touch(cfg: AppConfig, df: pd.DataFrame) -> tuple[int, int, Recorder]:
     _restore()
@@ -285,11 +293,16 @@ def test_touch_alert_live_then_confirmed():
     assert rec.kinds == ["essl_tap", "essl_tap"], rec.kinds
     assert "LIVE (intraday bar" in rec.messages[0], rec.messages[0]
     assert "LIVE (intraday bar" not in rec.messages[1], rec.messages[1]
-    # shipped 60-min guard -> still exactly one alert for that touch
+    # shipped 60-min guard -> the confirmed follow-up of the SAME bar still
+    # arrives (it is a distinct fact, the close verdict, not a repeat), and
+    # nothing else does: dedup keeps the pair at exactly two messages.
     live2, closed2, rec2 = _two_pass_touch(mk_cfg(**SHIPPED_FILTERS), df)
-    assert (live2, closed2) == (1, 0), (live2, closed2, rec2.kinds)
+    assert (live2, closed2) == (1, 1), (live2, closed2, rec2.kinds)
+    assert rec2.kinds == ["essl_tap", "essl_tap"], rec2.kinds
+    assert "LIVE (intraday bar" in rec2.messages[0], rec2.messages[0]
+    assert "LIVE (intraday bar" not in rec2.messages[1], rec2.messages[1]
     print("ok test_touch_alert_live_then_confirmed "
-          "(LIVE + confirmed follow-up; 1 alert per touch with the 60-min guard)")
+          "(LIVE + close-confirmed follow-up; exactly 2 messages per touch)")
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +381,162 @@ def test_break_bar_never_alerts_a_touch():
           f"({len(evs)} level(s) broken on bar {BAR_BREAK}, 0 touch alerts)")
 
 
+# ---------------------------------------------------------------------------
+# 8c. THE FMGOETZE 432.65 HALF OF THE INCIDENT (2026-09-11, the shipped DAILY
+# setup). A still-active level that is swept and closed back above must reach
+# the user as 💧 … RECLAIMED ✅ — both the provisional LIVE message and, at the
+# bar close, the confirmed one. PR #11 made the mid-break forming bar silent and
+# deferred the verdict to the close ("a reclaim then alerts via the confirmed
+# sweep tap"), but the per-level `alert_cooldown_minutes` guard then ate exactly
+# that confirmed follow-up: on a daily bar the confirming pass always runs within
+# the cooldown window of the last intraday poll, so the close-confirmed alert
+# the indicator actually shows never arrived.
+# ---------------------------------------------------------------------------
+DAILY_SYM = "FMGOETZE.NS"
+ESSL_ACTIVE = 432.65      # origin 2026-07-08 in the incident — still ACTIVE
+ESSL_BROKEN = 445.65      # origin 2026-08-17 — retired by the 09-10 close below
+DAILY_END = pd.Timestamp("2026-09-11")     # the Friday of the incident
+TICK_NS = 0.05
+
+
+def fmgoetze_daily(last: tuple | None = None) -> pd.DataFrame:
+    """63 daily bars replaying the incident at its real prices.
+
+    bar 24 = 432.65 major low  -> eSSL published on bar 34 (stays active)
+    bar 44 = 445.65 major low  -> eSSL published on bar 54
+    bar 61 = 2026-09-10          low 441.30, close 443.55: full penetration of
+                                 445.65 with the close BELOW it -> the indicator
+                                 RETIRES that level (a break, never a touch)
+    bar 62 = 2026-09-11          low 431.20, close 453.25: sweeps the still
+                                 active 432.65 and closes back above it ->
+                                 SWEEP + "RECLAIMED ✅" (the alert the user wants)
+    `last` replaces the final bar, i.e. an intraday snapshot of that session.
+    """
+    rows: list[tuple] = []
+
+    def add(o, h, l, c):
+        rows.append((float(o), float(h), float(l), float(c), 1_500_000.0))
+
+    for px in (452.0, 454.0, 456.0, 458.0, 460.0,               # 0..12 climb
+               461.0, 462.0, 463.0, 464.0, 465.0,
+               466.0, 467.0, 468.0):
+        add(px, px + 1.5, px - 1.5, px + 1.0)
+    add(469.0, 472.0, 468.0, 471.5)                             # 13 pivot high (472)
+    add(470.0, 471.0, 468.0, 468.5)                             # 14
+    for px in (464.0, 458.0, 452.0, 448.0, 444.0, 441.0, 438.5, 436.0):   # 15..22 fall
+        add(px, px + 1.2, px - 1.8, px - 1.2)
+    add(434.5, 435.5, 433.2, 433.6)                             # 23
+    add(433.5, 436.0, ESSL_ACTIVE, 435.0)                       # 24: 432.65 pivot low
+    for px in (436.0, 438.0, 440.5, 443.0, 446.0, 448.5, 450.0, 451.0, 452.0):
+        add(px, px + 1.4, px - 1.0, px + 0.8)                   # 25..33 rally
+    for px in (451.0, 450.0, 449.2, 448.6, 448.0, 447.6, 447.2, 447.0, 446.8):
+        add(px, px + 1.2, px - 0.8, px - 0.4)                   # 34..42 pullback
+    add(446.5, 447.0, 446.1, 446.3)                             # 43
+    add(446.2, 447.2, ESSL_BROKEN, 446.0)                       # 44: 445.65 pivot low
+    for px in (447.5, 448.5, 449.5, 450.5, 451.5, 452.5, 453.5, 454.5, 455.5, 456.0):
+        add(px, px + 1.2, px - 0.6, px + 0.8)                   # 45..54 rally
+    for px in (456.5, 455.5, 454.5, 453.5, 452.5, 451.5):       # 55..60 hover
+        add(px, px + 1.2, px - 1.0, px + 0.4)
+    add(450.0, 451.0, 441.30, 443.55)                           # 61 = 09-10 BREAK
+    add(442.0, 454.00, 431.20, 453.25)                          # 62 = 09-11 SWEEP+RECLAIM
+    if last is not None:
+        rows[-1] = tuple(float(x) for x in last) + (1_500_000.0,)
+    idx = pd.bdate_range(end=DAILY_END, periods=len(rows))
+    df = pd.DataFrame(rows, index=idx,
+                      columns=["open", "high", "low", "close", "volume"]).astype(float)
+    df.index.name = "date"
+    return df
+
+
+def mk_daily_cfg(**kw) -> AppConfig:
+    """The shipped daily setup (config.yaml: interval 1d, the three tap events,
+    provisional alerts on, the 60-min per-level cooldown)."""
+    cfg = AppConfig()
+    cfg.symbols = [DAILY_SYM]
+    cfg.data = DataConfig(source="yahoo", interval="1d", history_bars=600, max_bars=0)
+    cfg.scanner.min_bars = 10
+    cfg.scanner.recent_bars = 3
+    cfg.scanner.provisional_alerts = True
+    cfg.scanner.alert_cooldown_minutes = 60
+    cfg.scanner.alert_events = list(SHIPPED)
+    cfg.scanner.state_file = os.path.join(tempfile.mkdtemp(prefix="fpfssl-daily-"),
+                                          "scanner_state.json")
+    for k, v in kw.items():
+        setattr(cfg.scanner, k, v)
+    return cfg
+
+
+def scan_daily(cfg: AppConfig, df: pd.DataFrame, hhmm: tuple[int, int], rec: Recorder) -> int:
+    """One scanner pass with the market clock at hhmm IST on the last bar's day."""
+    _restore()
+    now = DAILY_END.replace(hour=hhmm[0], minute=hhmm[1])
+    scanner.load_symbol = lambda sym, d: df
+    scanner.market_now = lambda c: now
+    try:
+        return scanner.LiveScanner(cfg, rec, symbols=[DAILY_SYM]).scan_symbol(DAILY_SYM)
+    finally:
+        _restore()
+
+
+def test_fmgoetze_reclaim_alerts_live_and_at_the_close():
+    df = fmgoetze_daily()
+    last = len(df) - 1
+
+    # ---- engine: the two halves of the incident, one bar apart -------------
+    evs = Engine(DAILY_SYM, EngineConfig(), TICK_NS, tf="1d").run(df, live_last_bar=False).events
+    breaks = [e for e in evs if e.kind == K_ESSL_BREAK and e.bar == last - 1]
+    assert [round(e.price, 2) for e in breaks] == [ESSL_BROKEN], \
+        "the 09-10 bar must retire 445.65 as a break"
+    assert [e for e in evs if e.kind == K_ESSL_TAP and e.bar == last - 1] == [], \
+        "a level retired at this close is not a touch (the FMGOETZE 445.65 bug)"
+    taps = [e for e in evs if e.kind == K_ESSL_TAP and e.bar == last]
+    assert [round(e.price, 2) for e in taps] == [ESSL_ACTIVE], taps
+    assert taps[0].extra["reclaimed"] is True and taps[0].extra["penetrated"] is True
+    # the same level, 28 bars after it was published: old but still ACTIVE
+    assert int(taps[0].extra["age_bars"]) > 20, taps[0].extra
+
+    # ---- scanner: the CI poll sequence over that session -------------------
+    cfg = mk_daily_cfg()
+    rec = Recorder()
+    # 15:20 — the bar has already pierced the level and the running close is
+    # still under it: a mid-break forming bar waits for the close (PR #11).
+    dip = fmgoetze_daily(last=(442.0, 443.0, 431.20, 432.00))
+    assert scan_daily(cfg, dip, (15, 20), rec) == 0, rec.messages
+    # 15:35 — price is back above 432.65: the LIVE tap goes out.
+    assert scan_daily(cfg, df, (15, 35), rec) == 1, rec.messages
+    live = rec.messages[-1]
+    assert "eSSL level <b>432.65</b>" in live and "RECLAIMED ✅" in live, live
+    assert "LIVE (intraday bar" in live, live
+    assert "445.65" not in live, live
+    # 16:20 — the bar is CLOSED. This is the alert that used to vanish: the
+    # per-level 60-min cooldown was still open from the LIVE pass, so the
+    # close-confirmed "RECLAIMED ✅" was silently dropped.
+    n = len(rec.messages)
+    assert scan_daily(cfg, df, (16, 20), rec) == 1, "confirmed close alert swallowed"
+    conf = rec.messages[-1]
+    assert "RECLAIMED ✅" in conf and "432.65" in conf, conf
+    assert "LIVE (intraday bar" not in conf, conf
+    assert len(rec.messages) == n + 1
+    # 16:35 — a further poll repeats nothing: dedup is per bar+state+level, so
+    # bypassing the cooldown cannot turn into a stream.
+    assert scan_daily(cfg, df, (16, 35), rec) == 0, rec.messages
+    assert len(rec.messages) == n + 1, rec.messages
+
+    # a scanner that only ever sees the closed bar still alerts it
+    rec2 = Recorder()
+    assert scan_daily(mk_daily_cfg(), df, (16, 20), rec2) == 1, rec2.messages
+    assert "RECLAIMED ✅" in rec2.messages[0], rec2.messages[0]
+
+    # ---- the ⚠️ essl_break channel is wired in the scanner ------------------
+    # (PR #12's merge replaced this mapping entry with `essl_reclaim` and the
+    # documented break alert silently became impossible again.)
+    rec3 = Recorder()
+    assert scan_daily(mk_daily_cfg(alert_events=["essl_break"]), df, (16, 20), rec3) == 1
+    assert "eSSL BREAK" in rec3.messages[0] and "445.65" in rec3.messages[0], rec3.messages
+    print("ok test_fmgoetze_reclaim_alerts_live_and_at_the_close "
+          "(LIVE tap + close-confirmed RECLAIMED ✅ on 432.65, 445.65 only as a break)")
+
+
 ALL = [
     test_touch_without_footprint_tap_alerts,
     test_old_essl_level_touch_alerts,
@@ -379,6 +548,7 @@ ALL = [
     test_engine_taps_old_level_live_and_confirmed,
     test_shipped_config_enables_essl_tap,
     test_break_bar_never_alerts_a_touch,
+    test_fmgoetze_reclaim_alerts_live_and_at_the_close,
 ]
 
 

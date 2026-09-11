@@ -419,11 +419,17 @@ zone is 685 bars old — it fails against the trimmed implementation.
   on an eSSL level.
 * The forming last bar goes through section (G) (TAP) and the group-8
   forming-bar eSSL pass, so a LIVE alert can be sent mid-bar; the closed bar
-  has a distinct dedupe key (and is normally suppressed by the cooldown).
+  has a distinct dedupe key and alerts again — that confirmed follow-up is the
+  close state the indicator shows, so it is exempt from the cooldown (a daily
+  bar's confirming pass always lands inside the window; suppressing it there is
+  what swallowed the FMGOETZE 432.65 `RECLAIMED ✅` alert after PR #11 deferred
+  a mid-break bar's verdict to the close).
 * Dedupe key = `symbol | interval | event | bar-time | confirmed? | zone/pool`.
   Cooldown = per `symbol+event`, so distinct signals of the same kind inside the
   window collapse into one message — **except** `essl_tap`, whose cooldown is per
-  `symbol+event+level` so two eSSL levels touched on the same bar both alert.
+  `symbol+event+level` so two eSSL levels touched on the same bar both alert, and
+  except the confirmed counterpart of a bar that was already alerted LIVE (a
+  different dedupe key, so exactly one such follow-up per bar+object, never more).
 
 ### 10.3 Scheduling reality
 

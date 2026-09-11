@@ -164,7 +164,11 @@ is the indicator's *first full penetration is terminal* rule: the level is
 retired at that very close, so it is no longer a touchable level when the
 alert's bar ends. That outcome is a ⚠️ `essl_break` (enable it in
 `alert_events`), never a 💧 touch — a bar still forming below the level waits
-for the close instead of alerting mid-break.
+for the close instead of alerting mid-break. The verdict of that wait is the
+**close-confirmed** alert, which is sent even while the 60-minute per-level
+guard is still open for that level (see *Provisional vs confirmed* below) —
+that follow-up is what delivers `RECLAIMED ✅` on a daily bar like the FMGOETZE
+432.65 sweep.
 
 ```
 💧 eSSL TAP — price touched the eSSL level
@@ -323,13 +327,20 @@ Behaviour details:
   updates roll back naturally — exactly like Pine's live last bar.
 * **Provisional vs confirmed** — events on the still-forming bar are sent with a
   `LIVE (intraday bar — provisional)` tag, immediately when the bar is still
-  forming. The closed bar has a separate dedupe key, so it *may* alert again —
-  in practice the `alert_cooldown_minutes` spam guard (60 min) usually suppresses
-  that follow-up, which is why the LIVE message is the one to act on. Set
-  `provisional_alerts: false` to only alert on closed bars.
+  forming. The closed bar has a separate dedupe key, so it alerts **again**: that
+  second message is the state the indicator itself shows at the close (e.g. the
+  `RECLAIMED ✅` of a swept eSSL level), and it is deliberately *not* suppressed
+  by `alert_cooldown_minutes` — on the daily timeframe the confirming pass always
+  runs within the cooldown window of the last intraday poll, so letting the guard
+  eat it would mean the close-confirmed alert never arrives at all. Dedup still
+  applies per bar+state+object, so a touch is at most two messages (the guess and
+  the verdict), never a stream. Set `provisional_alerts: false` to only alert on
+  closed bars.
 * **Deduplication** — state is persisted in `state/scanner_state.json`; the same
   (symbol, timeframe, event, bar-time, confirmed?, object) never alerts twice, and
-  a per symbol+event cooldown (default 60 min) prevents spam.
+  a per symbol+event cooldown (default 60 min) prevents spam across *different*
+  bars (the one exception is the close-confirmed counterpart of a bar already
+  alerted LIVE, see above).
 * **Stale/lag guards** — symbols whose last bar is older than `max_stale_days`
   *trading* days are skipped (weekends don't count), as are symbols lagging more
   than `max_lag_minutes` behind the live NSE clock. Pre-open (or on a holiday)
