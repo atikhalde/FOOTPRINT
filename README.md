@@ -182,8 +182,8 @@ for the close instead of alerting mid-break.
 |---|---|
 | `essl_ob_tap` | 🚨 the composite above (primary) |
 | `essl_tap` | 💧 price touched an active eSSL level (fresh or old; footprint TAP not required) |
-| `essl_sweep` | eSSL penetration with close reclaim — liquidity grabbed at the external low |
-| `essl_break` | ⚠️ eSSL closed below (no reclaim) — the indicator retires the level at that close |
+| `essl_sweep` | eSSL penetration + close reclaim **FROM ABOVE** (wick sweep / liquidity grab) — labelled a **sweep**, *not* a fresh reclaim |
+| `essl_reclaim` | genuine reclaim **FROM BELOW** (prior close under the level, now back above) — the only one labelled **RECLAIMED ✅** |
 | `footprint_tap` | source-compatible TAP on any confirmed FP-OB (no eSSL coincidence required) |
 | `defence` | source defence confirmed after a TAP (bullish bar, CLV ≥ 0.65, RVOL ≥ 1.3, close > zone top, micro-BOS) |
 | `zone_invalid` | OB invalidated (live close < fixed stop) or tap limit exceeded |
@@ -205,8 +205,8 @@ scanner:
 Skipped taps are logged (`composite skipped — OB #7 age 132 bars > fresh window
 50`) so a quiet pass still explains itself. Set either toggle to `false` to
 restore the unfiltered stream. The default `alert_events` list is
-`essl_ob_tap` + `essl_tap` + `footprint_tap` — add the muted events back to
-re-enable them.
+`essl_ob_tap` + `essl_tap` + `essl_sweep` + `essl_reclaim` + `footprint_tap` —
+add the muted events back to re-enable them.
 
 ---
 

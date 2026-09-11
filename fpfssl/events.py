@@ -14,8 +14,9 @@ K_ZONE_INVALID = "zone_invalid"  # zone invalid (stop / tap limit / cap)
 K_SSL_CREATED = "essl_created"   # new eSSL reference published
 K_ISSL_CREATED = "issl_created"  # new iSSL reference published
 K_ESSL_TAP = "essl_tap"          # price tapped an active eSSL level (live + confirmed)
-K_ESSL_SWEEP = "essl_sweep"      # confirmed eSSL penetration WITH close reclaim (liquidity grab)
+K_ESSL_SWEEP = "essl_sweep"      # confirmed eSSL penetration WITH close reclaim, FROM ABOVE (wick sweep)
 K_ESSL_BREAK = "essl_break"      # confirmed eSSL penetration WITHOUT reclaim
+K_ESSL_RECLAIM = "essl_reclaim"  # genuine reclaim FROM BELOW (prior close below the level, now back above)
 K_FRESH_ESSL = "fresh_essl"      # new FRESH confirmed (unswept) eSSL-scale low reference
 
 
@@ -93,8 +94,17 @@ def _essl_line(ev: Event) -> str:
         line += f" | penetrated <b>{_p(depth)}</b> below level"
     else:
         line += " | touched the level"
-    if re is True:
+    rk = e.get("reclaim_kind")
+    if rk == "recovery":
+        # genuine reclaim FROM BELOW: prior close was under the level, now back above
         line += "\n   close <b>%s</b> back above level → <b>RECLAIMED ✅</b>" % _p(e.get("close"))
+    elif rk in ("sweep", "gap_reclaim"):
+        # a wick sweep / gap reclaim FROM ABOVE — reclaimed on paper, but the
+        # level was never closed below, so it is NOT a fresh ("not old") reclaim
+        line += ("\n   close <b>%s</b> reclaimed above the level — SWEEP "
+                 "(from above; not a fresh reclaim)" % _p(e.get("close")))
+    elif re is True:
+        line += "\n   close <b>%s</b> back above level → RECLAIMED ✅" % _p(e.get("close"))
     elif re is False:
         line += "\n   close <b>%s</b> below level → NOT reclaimed ⚠️" % _p(e.get("close"))
     return line
@@ -162,7 +172,11 @@ def format_event(symbol: str, tf: str, ev: Event) -> str:
                          "eSSL level (fresh or old, no footprint TAP required)")
         return "\n".join(parts)
     if ev.kind == K_ESSL_SWEEP:
-        head = _head(symbol, tf, ev, "eSSL SWEEP + RECLAIM — liquidity grabbed at external low", "🌀")
+        head = _head(symbol, tf, ev, "eSSL SWEEP — liquidity grabbed below the external low (close reclaimed from above)", "🌀")
+        parts = [head, _essl_line(ev)]
+        return "\n".join(parts)
+    if ev.kind == K_ESSL_RECLAIM:
+        head = _head(symbol, tf, ev, "eSSL RECLAIM — external level reclaimed from below", "↩️")
         parts = [head, _essl_line(ev)]
         return "\n".join(parts)
     if ev.kind == K_ESSL_BREAK:

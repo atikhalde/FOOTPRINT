@@ -43,7 +43,7 @@ from .data import DataError, load_all, load_symbol
 from .engine import Engine, detect_tick
 from .events import (
     K_DEFENCE,
-    K_ESSL_BREAK,
+    K_ESSL_RECLAIM,
     K_ESSL_SWEEP,
     K_ESSL_TAP,
     K_FOOTPRINT,
@@ -581,7 +581,7 @@ class LiveScanner:
                     K_DEFENCE: "defence",
                     K_ZONE_INVALID: "zone_invalid",
                     K_ESSL_SWEEP: "essl_sweep",
-                    K_ESSL_BREAK: "essl_break",
+                    K_ESSL_RECLAIM: "essl_reclaim",
                     K_SSL_CREATED: "essl_created",
                     K_FOOTPRINT: "footprint_created",
                 }
