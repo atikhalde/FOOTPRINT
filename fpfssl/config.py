@@ -172,8 +172,7 @@ class ScannerConfig:
     alert_events: list[str] = field(default_factory=lambda: [
         "essl_ob_tap",    # composite: eSSL tap on a bar where a footprint TAP also fires (ALL RULES)
         "essl_tap",       # price TOUCHED an active eSSL level (fresh or old; no footprint TAP needed)
-        "essl_sweep",     # confirmed eSSL sweep / gap reclaim FROM ABOVE (liquidity grab + reclaim)
-        "essl_reclaim",   # genuine reclaim FROM BELOW (prior close below, now back above) — the "RECLAIMED" alert
+        "essl_sweep",     # confirmed eSSL sweep / gap reclaim (liquidity grab + reclaim)
         "footprint_tap",  # source-compatible TAP on any confirmed FP-OB
         "defence",        # source defence confirmation after a TAP
         "zone_invalid",   # zone invalidated (stop) or touch limit exceeded

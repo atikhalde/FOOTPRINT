@@ -43,7 +43,7 @@ from .data import DataError, load_all, load_symbol
 from .engine import Engine, detect_tick
 from .events import (
     K_DEFENCE,
-    K_ESSL_RECLAIM,
+    K_ESSL_BREAK,
     K_ESSL_SWEEP,
     K_ESSL_TAP,
     K_FOOTPRINT,
@@ -381,13 +381,26 @@ class LiveScanner:
 
     # -- alerting ------------------------------------------------------------
     def _try_alert(self, sym: str, kind: str, message: str, dedup_key: str,
-                   cooldown_key: str | None = None) -> bool:
+                   cooldown_key: str | None = None,
+                   follow_up_of: str | None = None) -> bool:
         """Send one alert unless it was already sent or is inside its cooldown.
 
         `cooldown_key` defaults to `symbol|kind` (one stream per event type).
         Callers pass a finer key when several *distinct objects* of the same
         kind are alertable at once — e.g. two different eSSL levels touched on
         the same bar — so one level's alert cannot swallow the other's.
+
+        `follow_up_of` is the dedup key of the *provisional* (LIVE) alert this
+        message is the confirmed counterpart of. The LIVE alert is a guess made
+        at an intrabar price; the confirmed one carries the bar's actual close,
+        which is the state the indicator itself shows — `provisional_alerts`
+        documents "alert on the still-forming bar too, then again when
+        confirmed". The per-symbol+kind cooldown must not eat that follow-up
+        (on the shipped daily timeframe the confirming pass always lands within
+        `alert_cooldown_minutes` of the last intraday poll, so every
+        LIVE-then-confirmed pair used to collapse into the LIVE half and the
+        close-confirmed alert was silently dropped). It is still deduped, so
+        this can send at most ONE follow-up per bar+object, never a stream.
         """
         sc = self.cfg.scanner
         now = datetime.now()
@@ -395,7 +408,7 @@ class LiveScanner:
             return False
         cd_key = cooldown_key or f"{sym}|{kind}"
         last = self.state["cooldown"].get(cd_key)
-        if last:
+        if last and not (follow_up_of and follow_up_of in self.state["alerted"]):
             try:
                 if now - datetime.fromisoformat(last) < timedelta(minutes=sc.alert_cooldown_minutes):
                     return False
@@ -538,7 +551,12 @@ class LiveScanner:
                         msg = format_composite(sym, tf, tap, essl)
                         key = f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|{tap.confirmed}|{tap.zone_id}|{essl.pool_id}"
                         covered = key in self.state["alerted"]  # sent on an earlier pass
-                        if self._try_alert(sym, "essl_ob_tap", msg, key):
+                        # the confirmed counterpart of an already-alerted LIVE
+                        # composite must not be eaten by the spam guard
+                        follow_up = (f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|False|"
+                                     f"{tap.zone_id}|{essl.pool_id}" if tap.confirmed else None)
+                        if self._try_alert(sym, "essl_ob_tap", msg, key,
+                                           follow_up_of=follow_up):
                             sent += 1
                             covered = True
                         if covered:
@@ -581,7 +599,7 @@ class LiveScanner:
                     K_DEFENCE: "defence",
                     K_ZONE_INVALID: "zone_invalid",
                     K_ESSL_SWEEP: "essl_sweep",
-                    K_ESSL_RECLAIM: "essl_reclaim",
+                    K_ESSL_BREAK: "essl_break",
                     K_SSL_CREATED: "essl_created",
                     K_FOOTPRINT: "footprint_created",
                 }
@@ -597,7 +615,15 @@ class LiveScanner:
                 # the same bar cannot mask each other (all other kinds keep the
                 # single per-symbol+kind spam guard).
                 cd = f"{sym}|{kind}|{obj}" if kind == "essl_tap" else None
-                if self._try_alert(sym, kind, msg, key, cooldown_key=cd):
+                # A confirmed alert whose LIVE twin on this very bar already went
+                # out is the close-confirmed version of the same fact, not a
+                # repeat: it bypasses the cooldown (dedup still allows exactly
+                # one of them). That is what delivers the "RECLAIMED ✅" state
+                # the indicator shows at the bar close (FMGOETZE 432.65).
+                follow_up = (f"{sym}|{cfg.data.interval}|{kind}|{date}|False|{obj}"
+                             if ev.confirmed else None)
+                if self._try_alert(sym, kind, msg, key, cooldown_key=cd,
+                                   follow_up_of=follow_up):
                     sent += 1
         return sent
 

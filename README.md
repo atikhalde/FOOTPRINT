@@ -164,7 +164,11 @@ is the indicator's *first full penetration is terminal* rule: the level is
 retired at that very close, so it is no longer a touchable level when the
 alert's bar ends. That outcome is a ⚠️ `essl_break` (enable it in
 `alert_events`), never a 💧 touch — a bar still forming below the level waits
-for the close instead of alerting mid-break.
+for the close instead of alerting mid-break. The verdict of that wait is the
+**close-confirmed** alert, which is sent even while the 60-minute per-level
+guard is still open for that level (see *Provisional vs confirmed* below) —
+that follow-up is what delivers `RECLAIMED ✅` on a daily bar like the FMGOETZE
+432.65 sweep.
 
 ```
 💧 eSSL TAP — price touched the eSSL level
@@ -182,8 +186,8 @@ for the close instead of alerting mid-break.
 |---|---|
 | `essl_ob_tap` | 🚨 the composite above (primary) |
 | `essl_tap` | 💧 price touched an active eSSL level (fresh or old; footprint TAP not required) |
-| `essl_sweep` | eSSL penetration + close reclaim **FROM ABOVE** (wick sweep / liquidity grab) — labelled a **sweep**, *not* a fresh reclaim |
-| `essl_reclaim` | genuine reclaim **FROM BELOW** (prior close under the level, now back above) — the only one labelled **RECLAIMED ✅** |
+| `essl_sweep` | eSSL penetration with close reclaim — liquidity grabbed at the external low |
+| `essl_break` | ⚠️ eSSL closed below (no reclaim) — the indicator retires the level at that close |
 | `footprint_tap` | source-compatible TAP on any confirmed FP-OB (no eSSL coincidence required) |
 | `defence` | source defence confirmed after a TAP (bullish bar, CLV ≥ 0.65, RVOL ≥ 1.3, close > zone top, micro-BOS) |
 | `zone_invalid` | OB invalidated (live close < fixed stop) or tap limit exceeded |
@@ -205,8 +209,8 @@ scanner:
 Skipped taps are logged (`composite skipped — OB #7 age 132 bars > fresh window
 50`) so a quiet pass still explains itself. Set either toggle to `false` to
 restore the unfiltered stream. The default `alert_events` list is
-`essl_ob_tap` + `essl_tap` + `essl_sweep` + `essl_reclaim` + `footprint_tap` —
-add the muted events back to re-enable them.
+`essl_ob_tap` + `essl_tap` + `footprint_tap` — add the muted events back to
+re-enable them.
 
 ---
 
@@ -323,13 +327,20 @@ Behaviour details:
   updates roll back naturally — exactly like Pine's live last bar.
 * **Provisional vs confirmed** — events on the still-forming bar are sent with a
   `LIVE (intraday bar — provisional)` tag, immediately when the bar is still
-  forming. The closed bar has a separate dedupe key, so it *may* alert again —
-  in practice the `alert_cooldown_minutes` spam guard (60 min) usually suppresses
-  that follow-up, which is why the LIVE message is the one to act on. Set
-  `provisional_alerts: false` to only alert on closed bars.
+  forming. The closed bar has a separate dedupe key, so it alerts **again**: that
+  second message is the state the indicator itself shows at the close (e.g. the
+  `RECLAIMED ✅` of a swept eSSL level), and it is deliberately *not* suppressed
+  by `alert_cooldown_minutes` — on the daily timeframe the confirming pass always
+  runs within the cooldown window of the last intraday poll, so letting the guard
+  eat it would mean the close-confirmed alert never arrives at all. Dedup still
+  applies per bar+state+object, so a touch is at most two messages (the guess and
+  the verdict), never a stream. Set `provisional_alerts: false` to only alert on
+  closed bars.
 * **Deduplication** — state is persisted in `state/scanner_state.json`; the same
   (symbol, timeframe, event, bar-time, confirmed?, object) never alerts twice, and
-  a per symbol+event cooldown (default 60 min) prevents spam.
+  a per symbol+event cooldown (default 60 min) prevents spam across *different*
+  bars (the one exception is the close-confirmed counterpart of a bar already
+  alerted LIVE, see above).
 * **Stale/lag guards** — symbols whose last bar is older than `max_stale_days`
   *trading* days are skipped (weekends don't count), as are symbols lagging more
   than `max_lag_minutes` behind the live NSE clock. Pre-open (or on a holiday)

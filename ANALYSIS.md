@@ -319,22 +319,19 @@ Everything above is ported 1:1 (verified by the hand-crafted scenario suite in
 `tests/test_engine.py`). The additions are all in a clearly-marked **group 8** layer:
 
 1. **eSSL tap events** — the source has *no alerts*. The port emits `essl_tap`
-   (touch / partial / full penetration, with the script's own penetration & reclaim
-   definitions), `essl_sweep`, `essl_reclaim`, and `essl_break` so the scanner
-   can alert. An `essl_tap` fires for **every** touch of **every** active external
-   level — fresh or old, first visit or repeat, on the forming bar and on confirmed
-   bars alike. The only age rule is `essl_tap_max_age`, applied identically on both
-   paths (default 250 = `ssl_max_age`, i.e. every live level counts).
-
-   **Reclaim vs sweep labelling.** The engine's four reclaim-style states are kept
-   exactly as the source defines them (`SWEEP` / `GAP_RECLAIM` from **above**,
-   `RECOVERY` from **below**). The port's alert events split them: a wick **sweep
-   from above** emits `essl_sweep` and is labelled a *sweep* (close reclaimed the
-   level, but the level was never closed below — "not a fresh reclaim"); a genuine
-   **recovery from below** (prior close under the level, now back above) emits
-   `essl_reclaim` and is the **only** one labelled **RECLAIMED ✅**. A close below
-   the level emits `essl_break` ("NOT reclaimed"). So the alert only reads
-   RECLAIMED on a true from-below reclaim — never on an "old" wick reclaim.
+   (touch / partial / sweep-and-reclaim, with the script's own penetration & reclaim
+   definitions), `essl_sweep`, and `essl_break` so the scanner can alert. An
+   `essl_tap` fires for **every** touch of **every** active external level — fresh
+   or old, first visit or repeat, on the forming bar and on confirmed bars alike.
+   The only age rule is `essl_tap_max_age`, applied identically on both paths
+   (default 250 = `ssl_max_age`, i.e. every live level counts). "Active" follows
+   the source lifecycle strictly: the first full penetration is terminal
+   (`f_finishSSL`), so a bar whose close ends below the level (CLOSED_BELOW /
+   NO_RECLAIM / GAP_THROUGH) retires it at that close and alerts as `essl_break`
+   — never as a touch; only a bar that reclaimed (close back above the level)
+   still taps. The forming-bar path applies the same rule to the provisional
+   close: a bar already below the level stays silent until the close decides
+   between sweep-tap and break.
 2. **The composite ALL-RULES signal** (`essl_ob_tap`): on one bar, an active
    eSSL level is tapped **and** a confirmed FP-OB's source-TAP condition fires —
    i.e. *price taps the eSSL level with all the remaining rules matched*. This is the
@@ -422,11 +419,17 @@ zone is 685 bars old — it fails against the trimmed implementation.
   on an eSSL level.
 * The forming last bar goes through section (G) (TAP) and the group-8
   forming-bar eSSL pass, so a LIVE alert can be sent mid-bar; the closed bar
-  has a distinct dedupe key (and is normally suppressed by the cooldown).
+  has a distinct dedupe key and alerts again — that confirmed follow-up is the
+  close state the indicator shows, so it is exempt from the cooldown (a daily
+  bar's confirming pass always lands inside the window; suppressing it there is
+  what swallowed the FMGOETZE 432.65 `RECLAIMED ✅` alert after PR #11 deferred
+  a mid-break bar's verdict to the close).
 * Dedupe key = `symbol | interval | event | bar-time | confirmed? | zone/pool`.
   Cooldown = per `symbol+event`, so distinct signals of the same kind inside the
   window collapse into one message — **except** `essl_tap`, whose cooldown is per
-  `symbol+event+level` so two eSSL levels touched on the same bar both alert.
+  `symbol+event+level` so two eSSL levels touched on the same bar both alert, and
+  except the confirmed counterpart of a bar that was already alerted LIVE (a
+  different dedupe key, so exactly one such follow-up per bar+object, never more).
 
 ### 10.3 Scheduling reality
 
