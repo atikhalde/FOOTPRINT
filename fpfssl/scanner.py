@@ -6,8 +6,12 @@ is the configured market timezone (default Asia/Kolkata for NSE/BSE).
 
 Flow per poll, per symbol:
   1. fetch OHLCV (last bar = still-forming bar when the market is live)
-  2. run the faithful engine over the whole history
-  3. group events by bar; detect the composite ALL-RULES condition:
+  2. size filters: `scanner.min_price` (last close in ₹) and
+     `scanner.min_market_cap_cr` (cached share count x that close, ₹ crore —
+     fpfssl/fundamentals.py) skip the symbol BEFORE any engine work, so a
+     ₹40 penny stock on a small float costs nothing and cannot alert
+  3. run the faithful engine over the whole history
+  4. group events by bar; detect the composite ALL-RULES condition:
        eSSL tap  AND  footprint-source TAP  on the SAME bar
      plus the standalone eSSL LEVEL TOUCH (`essl_tap`): price reached an active
      eSSL level — fresh or old, with or without a footprint TAP that bar, and
@@ -20,11 +24,17 @@ Flow per poll, per symbol:
      outcome goes to `essl_break`, never to the touch channel, and a forming
      bar that is already below the level waits for the close instead of
      alerting mid-break.
-  4. dedupe against persisted state, apply cooldowns, format, send Telegram
+  5. dedupe against persisted state, apply cooldowns, format, send Telegram
 
 Dedup key: symbol | kind | bar-time | confirmed? | zone-or-pool-id
 Provisional (forming-bar) alerts carry a distinct key, so after the bar closes
 the scanner sends one follow-up "confirmed" version.
+
+Run mode: `scanner.exit_after_pass: true` (the shipped default) means ONE
+complete pass per run — save the dedup state and exit — instead of holding the
+process (and a CI job's `concurrency` group) until the close; `--keep-polling`
+restores the session-long poller. `scanner.max_pass_minutes` bounds a single
+pass, so a stalled feed cannot hang either mode.
 """
 from __future__ import annotations
 
@@ -53,6 +63,7 @@ from .events import (
     format_composite,
     format_event,
 )
+from .fundamentals import FundamentalTable, SizeFilters
 from .telegram import TelegramNotifier
 
 log = logging.getLogger("fpfssl.scanner")
@@ -239,13 +250,89 @@ def watch_lines(res, cfg: AppConfig, tick: float, limit: int = 3) -> list[str]:
 
 
 class LiveScanner:
-    def __init__(self, cfg: AppConfig, notifier: TelegramNotifier, symbols: list[str] | None = None):
+    def __init__(self, cfg: AppConfig, notifier: TelegramNotifier, symbols: list[str] | None = None,
+                 fundamentals: "FundamentalTable | None" = None,
+                 refresh_fundamentals: bool = False):
         self.cfg = cfg
         self.notifier = notifier
         self.symbols = symbols or list(cfg.symbols)
         self.state: dict = {"alerted": {}, "cooldown": {}}
+        self.filtered = 0          # symbols the size filters dropped this pass
+        self.scanned = 0           # symbols that reached the engine this pass
+        self._refresh_fundamentals = bool(refresh_fundamentals)
         self._init_runtime()
         self._load_state()
+        self.fundamentals = fundamentals
+
+    @property
+    def exit_after_pass(self) -> bool:
+        """`scanner.exit_after_pass`: stop the run when a pass completes."""
+        return bool(getattr(self.cfg.scanner, "exit_after_pass", False))
+
+    # -- size filters (market cap / price) ------------------------------------
+    @property
+    def filters(self) -> SizeFilters:
+        """`scanner.min_market_cap_cr` / `scanner.min_price` as a check object."""
+        if getattr(self, "_filters", None) is None:
+            self._filters = SizeFilters.from_config(self.cfg.scanner)
+        return self._filters
+
+    def _fund_table(self) -> FundamentalTable:
+        """Share-count table (disk-cached). Tests may inject one via the ctor."""
+        if getattr(self, "fundamentals", None) is None:
+            self.fundamentals = FundamentalTable(
+                cache_file=getattr(self.cfg.data, "fundamentals_cache_file", "") or "",
+                max_age_days=float(getattr(self.cfg.data, "fundamentals_max_age_days", 30.0) or 0),
+            ).load()
+        return self.fundamentals
+
+    def size_ok(self, sym: str, price: float) -> tuple[bool, str]:
+        """`(keep, reason)` for the scanner's size filters (no network here)."""
+        return self.filters.check(sym, price, self._fund_table())
+
+    def size_note(self, sym: str, price: float) -> str:
+        """One-line size summary appended to alerts, so a message explains that
+        the symbol cleared the filters (and what it is worth)."""
+        cr = self.filters.market_cap_cr(sym, price, self._fund_table())
+        bits = []
+        if price and price > 0:
+            bits.append(f"price ₹{price:,.2f}")
+        if cr:
+            bits.append(f"mcap ₹{cr:,.0f} Cr")
+        if not bits:
+            return ""
+        return ("\n\n📏 <b>size</b> " + " · ".join(bits)
+                + f" · filter: {self.filters.describe()}")
+
+    def _size_tail(self, sym: str, price: float) -> str:
+        """Size footer for an alert (empty when the filters are off).
+
+        Every alert states the stock it cleared (₹1,432 price / ₹945,000 Cr
+        market cap, say) plus the thresholds in force, so a message can be
+        verified against config.yaml without re-running `diagnose`.
+        """
+        if not self.filters.enabled:
+            return ""
+        return self.size_note(sym, price)
+
+    def prime_fundamentals(self, symbols: list[str], frames: dict[str, pd.DataFrame],
+                           refresh: bool = False) -> int:
+        """Fetch share counts for the symbols worth asking about (once per pass).
+
+        Only symbols that clear the *price* filter can reach the market-cap
+        filter, so those are the only ones fetched — over the full NSE list the
+        ₹100 floor typically halves the metadata work. Nothing here blocks a
+        scan: a failed fetch just leaves those symbols without a share count
+        (and `keep_unknown_market_cap` decides whether they are scanned).
+        """
+        flt = self.filters
+        if not flt.mcap_on or self.cfg.data.source != "yahoo":
+            return 0
+        table = self._fund_table()
+        cands = [s for s in symbols
+                 if s in frames and (flt.min_price <= 0
+                                     or float(frames[s]["close"].iloc[-1]) > flt.min_price)]
+        return table.prime(cands, refresh=refresh, fail_open=flt.fail_open, cfg=self.cfg)
 
     # -- cancellation / runtime budget ----------------------------------------
     def _init_runtime(self) -> None:
@@ -439,6 +526,19 @@ class LiveScanner:
         if len(df) < cfg.scanner.min_bars:
             log.info("%s: only %d bars (< %d), skipped", sym, len(df), cfg.scanner.min_bars)
             return 0
+        # ---- size filters (market cap / price) ------------------------------
+        # Before the staleness checks and, above all, before the engine: the
+        # whole point of `min_market_cap_cr` / `min_price` is that a stock that
+        # cannot produce a tradeable alert costs nothing. Price is the last
+        # close of the frame the pass already fetched (₹, raw exchange price),
+        # market cap is that price x the cached share count.
+        price_last = float(df["close"].iloc[-1])
+        keep, why = self.size_ok(sym, price_last)
+        if not keep:
+            self.filtered = getattr(self, "filtered", 0) + 1
+            log.info("%s: skipped by the size filters — %s", sym, why)
+            return 0
+        self.scanned = getattr(self, "scanned", 0) + 1
         now_mkt = market_now(cfg)
         last_ts = df.index[-1]
         if cfg.data.source == "yahoo":
@@ -548,7 +648,7 @@ class LiveScanner:
                 else:
                     provisional = not tap.confirmed
                     if not (provisional and not sc.provisional_alerts):
-                        msg = format_composite(sym, tf, tap, essl)
+                        msg = format_composite(sym, tf, tap, essl) + self._size_tail(sym, price_last)
                         key = f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|{tap.confirmed}|{tap.zone_id}|{essl.pool_id}"
                         covered = key in self.state["alerted"]  # sent on an earlier pass
                         # the confirmed counterpart of an already-alerted LIVE
@@ -609,7 +709,7 @@ class LiveScanner:
             for kind, ev, obj in singles:
                 if not ev.confirmed and not sc.provisional_alerts:
                     continue
-                msg = format_event(sym, tf, ev)
+                msg = format_event(sym, tf, ev) + self._size_tail(sym, price_last)
                 key = f"{sym}|{cfg.data.interval}|{kind}|{date}|{ev.confirmed}|{obj}"
                 # eSSL touches: one cooldown per LEVEL, so two levels tapped on
                 # the same bar cannot mask each other (all other kinds keep the
@@ -628,21 +728,102 @@ class LiveScanner:
         return sent
 
     # -- loops -----------------------------------------------------------------
+    def _pass_budget(self) -> float | None:
+        """Seconds a single pass may take (`scanner.max_pass_minutes`, None = off)."""
+        minutes = float(getattr(self.cfg.scanner, "max_pass_minutes", 0) or 0)
+        return minutes * 60.0 if minutes > 0 else None
+
+    def pass_out_of_time(self) -> bool:
+        return (getattr(self, "_pass_deadline", None) is not None
+                and time.monotonic() >= self._pass_deadline)
+
+    def _timed(self, fn, timeout: float | None, what: str):
+        """Run `fn()` in a DAEMON worker and abandon it (never the process) at the ceiling.
+
+        Returns `(value, stalled)`. A daemon thread rather than a
+        ThreadPoolExecutor is deliberate: an abandoned yfinance request must not
+        be able to keep the process alive at shutdown — interpreter exit joins
+        executor worker threads, which is exactly how "one slow pass" becomes
+        "the scanner is stuck and the CI job never ends".
+        """
+        box: dict = {}
+
+        def work():
+            try:
+                box["value"] = fn()
+            except BaseException as e:  # noqa: BLE001 - reported by the caller
+                box["err"] = e
+
+        th = threading.Thread(target=work, name=f"fpfssl-{what}", daemon=True)
+        th.start()
+        th.join(timeout)
+        if th.is_alive():
+            return None, True
+        if "err" in box:
+            raise box["err"]
+        return box.get("value"), False
+
     def scan_once(self) -> int:
         t0 = time.time()
         total = 0
+        budget = self._pass_budget()
+        self._pass_deadline = (time.monotonic() + budget) if budget else None
+        self.filtered = 0
+        self.scanned = 0
         # One batched yahoo fetch for the whole universe (full-NSE daily pass
         # = thousands of tickers: per-symbol fetches would crawl). Each symbol
         # then runs the engine over the same frame the per-symbol path would
         # have fetched, so signals are identical — only the transport differs.
         frames: dict[str, pd.DataFrame] = {}
         if self.cfg.data.source == "yahoo" and len(self.symbols) > 1 and self.cfg.data.batch:
+            left = budget
+            run_deadline = getattr(self, "_runtime_deadline", None)
+            if run_deadline is not None:
+                rem = run_deadline - time.monotonic()
+                left = rem if left is None else min(left, rem)
             try:
-                frames = load_all(self.symbols, self.cfg.data)
-            except DataError as e:  # noqa: BLE001
+                got, stalled = self._timed(
+                    lambda: load_all(self.symbols, self.cfg.data),
+                    left if left and left > 0 else None, "fetch")
+            except DataError as e:
                 log.error("batch load failed: %s", e)
+                got, stalled = {}, False
+            except Exception as e:  # noqa: BLE001
+                log.error("batch load failed: %s", e)
+                got, stalled = {}, False
+            if stalled:
+                # The ceiling exists precisely so a hung feed cannot hold the
+                # runner open forever: report it and end the run cleanly
+                # (dedup state saved) instead of retrying per-symbol against the
+                # same stalled endpoint for hours.
+                log.error("no bars this pass: the yahoo fetch stalled past "
+                          "scanner.max_pass_minutes (%d symbol(s) affected)",
+                          len(self.symbols))
+                self.request_stop("yahoo fetch stalled past the pass ceiling")
+                return 0
+            frames = got or {}
             log.info("fetched %d/%d symbols in %.1fs",
                      len(frames), len(self.symbols), time.time() - t0)
+        # Market-cap size filter: warm the share-count cache for exactly the
+        # symbols that can reach it, once per pass (in-memory afterwards, so
+        # scan_symbol never touches the network). Also under the pass ceiling:
+        # a slow metadata endpoint must not become a stuck scanner either, and
+        # unprimed symbols simply fail open (scanned, not silently skipped).
+        if self.filters.mcap_on:
+            deadline = getattr(self, "_pass_deadline", None)
+            rem = (deadline - time.monotonic()) if deadline is not None else None
+            try:
+                _n, stalled = self._timed(
+                    lambda: self.prime_fundamentals(
+                        self.symbols, frames,
+                        refresh=getattr(self, "_refresh_fundamentals", False)),
+                    rem if rem and rem > 0 else None, "fundamentals")
+                if stalled:
+                    log.warning("share-count fetch hit the pass ceiling — continuing "
+                                "with what the cache already knows")
+            except Exception as e:  # noqa: BLE001 - filters fail open, never fatal
+                log.warning("share-count fetch failed (%s) — the market-cap filter "
+                            "fails open for this pass", e)
         missing = 0
         done = 0
         stopped = ""
@@ -652,6 +833,11 @@ class LiveScanner:
             # symbol boundary.
             stopped = self._stop_now()
             if stopped:
+                break
+            if self.pass_out_of_time():
+                stopped = "pass ceiling reached (%d min)" % int((budget or 0) / 60)
+                log.warning("stopping the pass early: %s — %d/%d symbols scanned",
+                            stopped, done, len(self.symbols))
                 break
             try:
                 if frames:
@@ -673,23 +859,45 @@ class LiveScanner:
         if not self.cfg.telegram.dry_run:
             self._save_state()
         tf = timeframe_label(self.cfg.data.interval)
-        log.info("scan finished in %.1fs: %d new alert(s) across %d symbols [%s]",
-                 time.time() - t0, total, len(self.symbols), tf)
+        skipped = getattr(self, "filtered", 0)
+        flt = self.filters
+        tail = ""
+        if flt.enabled:
+            # make the filter visible in the log: how much of the universe the
+            # size filters removed, so "no alerts" is never mistaken for "no run"
+            tail = (" — %d symbol(s) scanned, %d filtered out [%s]"
+                    % (getattr(self, "scanned", 0), skipped, flt.describe()))
+        log.info("scan finished in %.1fs: %d new alert(s) across %d symbols [%s]%s",
+                 time.time() - t0, total, len(self.symbols), tf, tail)
         return total
 
     def run_forever(self) -> str:
-        """Poll until the session ends (or the run is stopped).
+        """Poll the market (or run a single pass) until it is time to stop.
 
-        Designed for a single scheduled trigger that has to cover the whole
-        NSE session (09:15-15:30 IST): GitHub's cron is best-effort and drops
-        most ticks of a 5-minute schedule, so one long job that polls
-        internally is far more reliable than 96 one-shot jobs.
+        Two modes, and the reason `exit_after_pass` exists is that the first
+        one is easy to mistake for a hang:
 
-        * started before the open   -> waits for the open, then polls
-        * started during the session -> polls immediately
-        * started after the close   -> one final pass, then exits
+        * `scanner.exit_after_pass: true` — ONE complete pass over the universe,
+          save the dedup state, exit. A scheduled run therefore ends as soon as
+          it has scanned the market instead of sitting in the runner until the
+          close, and the next cron tick does the next pass.
+        * `scanner.exit_after_pass: false` — poll until the session ends
+          (`stop_after_close_minutes` past the close). This is the design for a
+          single scheduled trigger that has to cover the whole NSE session
+          (09:15-15:30 IST), because GitHub's cron is best-effort and drops most
+          ticks of a 5-minute schedule; it costs a ~6h job that every later tick
+          queues behind.
+
+        Other behaviour (both modes):
+
+        * started before the open    -> waits for the open (only when the open
+          is within `preopen_wait_minutes`), then scans
+        * started after the close    -> one final pass, then exits
+        * a pass longer than `max_pass_minutes` -> cut at the next symbol
+          boundary, state saved, so a slow feed cannot outrun the job timeout
 
         Stops (saving dedup state) on any of:
+        * `exit_after_pass` (one pass per run);
         * the session ending (`stop_after_close_minutes` past the close);
         * SIGINT / SIGTERM — Ctrl-C or a cancelled CI job. Handlers are
           installed explicitly because a backgrounded process inherits SIGINT
@@ -705,11 +913,15 @@ class LiveScanner:
         self.install_stop_handlers()
         tf = timeframe_label(self.cfg.data.interval)
         now = market_now(self.cfg)
-        log.info("starting live scanner: %d symbols [%s], poll every %.1f min, "
-                 "session %s-%s %s (ctrl-c to stop)",
-                 len(self.symbols), tf, poll,
+        log.info("starting live scanner: %d symbols [%s], %s, "
+                 "session %s-%s %s (ctrl-c to stop)%s",
+                 len(self.symbols), tf,
+                 "one pass then exit" if self.exit_after_pass
+                 else f"poll every {poll:.1f} min until the close",
                  self.cfg.scanner.market_open, self.cfg.scanner.market_close,
-                 self.cfg.scanner.market_timezone)
+                 self.cfg.scanner.market_timezone,
+                 "" if not self.filters.enabled
+                 else f" — size filters: {self.filters.describe()}")
         # pre-open: wait for the bell instead of hammering the feed — but only
         # when the open is close. A run started hours early does one pass and
         # exits so it does not hold the runner (a later tick starts the session).
@@ -744,6 +956,19 @@ class LiveScanner:
                     if reason == "runtime limit reached":
                         log.info("%s — scanner exiting (dedup state saved; the next "
                                  "run picks the session back up)", reason)
+                    break
+                # scanner.exit_after_pass: the point is that a completed pass is
+                # a finished job. Napping here to wait for the next poll is what
+                # makes a scheduled run look stuck (and blocks the concurrency
+                # group for hours); the dedup state is already saved by
+                # scan_once, so the next tick resumes exactly where this ended.
+                if self.exit_after_pass:
+                    reason = "scan complete (scanner.exit_after_pass)"
+                    log.info("%s — %d symbol(s) scanned%s, scanner exiting "
+                             "(dedup state saved; the next run does the next pass)",
+                             reason, getattr(self, "scanned", 0),
+                             f", {getattr(self, 'filtered', 0)} filtered out"
+                             if self.filters.enabled else "")
                     break
                 now = market_now(self.cfg)
                 if _session_finished(self.cfg, now):

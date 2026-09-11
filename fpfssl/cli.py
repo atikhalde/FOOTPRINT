@@ -26,6 +26,7 @@ from . import __version__
 from .config import load_config
 from .data import DataError
 from .telegram import TelegramNotifier
+from .fundamentals import SizeFilters
 from .universe import expand_universe
 
 
@@ -47,6 +48,61 @@ def _expand(cfg, refresh: bool) -> None:
         sys.exit(2)
 
 
+def _apply_filter_args(cfg, args) -> None:
+    """CLI overrides for the size filters and the run/stop behaviour.
+
+    Mirrors how the other overrides work (flags win over config.yaml), so the
+    filters can be tried without editing the file:
+
+        python -m fpfssl scan --once --min-mcap-cr 20000 --min-price 500
+        python -m fpfssl scan --once --no-size-filters     # scan everything
+    """
+    sc = cfg.scanner
+    v = getattr(args, "min_mcap_cr", None)
+    if v is not None:
+        sc.min_market_cap_cr = max(0.0, float(v))
+    v = getattr(args, "min_price", None)
+    if v is not None:
+        sc.min_price = max(0.0, float(v))
+    if getattr(args, "no_size_filters", False):
+        sc.min_market_cap_cr = 0.0
+        sc.min_price = 0.0
+    v = getattr(args, "max_pass_minutes", None)
+    if v is not None:
+        sc.max_pass_minutes = max(0.0, float(v))
+    if getattr(args, "exit_after_pass", False):
+        sc.exit_after_pass = True
+    if getattr(args, "keep_polling", False):
+        sc.exit_after_pass = False
+
+
+def _add_filter_args(p) -> None:
+    g = p.add_argument_group("size filters / run mode")
+    g.add_argument("--min-mcap-cr", dest="min_mcap_cr", type=float, metavar="CR",
+                   help="scan only stocks whose market cap is above this many ₹ crore "
+                        "(0 = off; overrides scanner.min_market_cap_cr)")
+    g.add_argument("--min-price", dest="min_price", type=float, metavar="RS",
+                   help="scan only stocks trading above this price in ₹ "
+                        "(0 = off; overrides scanner.min_price)")
+    g.add_argument("--no-size-filters", action="store_true",
+                   help="ignore scanner.min_market_cap_cr / min_price (scan the whole universe)")
+    g.add_argument("--refresh-fundamentals", action="store_true",
+                   help="ignore the cached share counts (data/nse_fundamentals.csv) and "
+                        "fetch them again — only needed for the market-cap filter")
+
+
+def _add_run_mode_args(p) -> None:
+    g = p.add_argument_group("run mode")
+    g.add_argument("--exit-after-pass", dest="exit_after_pass", action="store_true",
+                   help="stop as soon as one complete pass is done (default in config.yaml: "
+                        "scanner.exit_after_pass) instead of polling until the close")
+    g.add_argument("--keep-polling", dest="keep_polling", action="store_true",
+                   help="keep the original behaviour: poll until the session ends")
+    g.add_argument("--max-pass-minutes", dest="max_pass_minutes", type=float, metavar="MIN",
+                   help="abort a single pass longer than this (0 = no ceiling; guards against "
+                        "a stalled feed hanging the run)")
+
+
 def cmd_scan(args):
     cfg = load_config(args.config)
     if args.symbols:
@@ -55,6 +111,7 @@ def cmd_scan(args):
         cfg.data.source = args.source
     if args.interval:
         cfg.data.interval = args.interval
+    _apply_filter_args(cfg, args)
     _expand(cfg, args.refresh_universe)
     if args.dry_run:
         cfg.telegram.dry_run = True
@@ -75,7 +132,7 @@ def cmd_scan(args):
     if notifier.cfg.dry_run:
         print("dry-run: Telegram messages will be printed, not sent.", file=sys.stderr)
     from .scanner import LiveScanner
-    sc = LiveScanner(cfg, notifier)
+    sc = LiveScanner(cfg, notifier, refresh_fundamentals=args.refresh_fundamentals)
     if args.once:
         sc.scan_once()
         return
@@ -206,6 +263,7 @@ def cmd_diagnose(args):
         cfg.data.interval = args.interval
     if args.bars:
         cfg.data.max_bars = args.bars
+    _apply_filter_args(cfg, args)
     _expand(cfg, args.refresh_universe)
     from .diag import format_diag_many, run_diag
     now = None
@@ -220,7 +278,14 @@ def cmd_diagnose(args):
                       file=sys.stderr)
                 sys.exit(2)
     live = True if args.live else None
-    diags = run_diag(cfg, cfg.symbols, now=now, live=live)
+    diags = run_diag(cfg, list(cfg.symbols), now=now, live=live,
+                     refresh_fundamentals=getattr(args, "refresh_fundamentals", False),
+                     max_symbols=int(getattr(args, "max_symbols", 0) or 0))
+    n_fl = sum(1 for d in diags if d.status == "filtered")
+    if n_fl and not args.json:
+        print(f"size filters ({SizeFilters.from_config(cfg.scanner).describe()}): "
+              f"{n_fl} of {len(diags)} symbol(s) filtered out (not scanned by the "
+              f"scanner either)")
     print(format_diag_many(diags, as_json=args.json))
     if any(d.status != "ok" for d in diags):
         sys.exit(0)
@@ -271,6 +336,8 @@ def main(argv=None):
     s.add_argument("--max-runtime-minutes", type=float, metavar="MIN",
                    help="stop polling after this many minutes even if the session is "
                         "still open (0 = no limit; CI sets it below the job timeout)")
+    _add_filter_args(s)
+    _add_run_mode_args(s)
     s.set_defaults(fn=cmd_scan)
 
     b = sub.add_parser("backtest", help="backtest the alert signals")
@@ -310,6 +377,11 @@ def main(argv=None):
     g.add_argument("--bars", type=int, help="cap bars per symbol (default: everything the feed gives)")
     g.add_argument("--refresh-universe", action="store_true",
                    help="ignore the cached full-NSE list and fetch it again")
+    g.add_argument("--max-symbols", type=int, metavar="N",
+                   help="run the engine for at most N symbols — the biggest ones that pass "
+                        "the size filters first (bounds a full-NSE diagnose in CI; every "
+                        "symbol still gets its filter verdict)")
+    _add_filter_args(g)
     g.set_defaults(fn=cmd_diagnose)
 
     d = sub.add_parser("sample-data", help="generate offline synthetic CSVs into data/")

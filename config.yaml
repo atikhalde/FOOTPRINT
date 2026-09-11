@@ -45,6 +45,11 @@ data:
   universe_cache_file: data/nse_universe.csv
   universe_max_age_days: 7
   tick_overrides: {}     # NSE/BSE resolve to 0.05 automatically; override only if needed, e.g. {RELIANCE.NS: 0.05}
+  # Share counts for the scanner's market-cap size filter (see fpfssl/fundamentals.py).
+  # Market cap = cached share count x last close, recomputed every pass, so only
+  # symbols the cache cannot answer cost a request (first full-NSE pass only).
+  fundamentals_cache_file: data/nse_fundamentals.csv
+  fundamentals_max_age_days: 30    # refetch a share count older than this
 
 scanner:
   poll_minutes: 15       # daily polling cadence (intraday TFs can poll faster)
@@ -69,6 +74,31 @@ scanner:
   market_open: "09:15"   # NSE equity open (IST)
   market_close: "15:30"  # NSE equity close (IST)
   recent_bars: 3         # only the last N bars can raise new alerts (daily + intraday)
+  # ---- size filters: only scan stocks big enough to be worth an alert ----
+  # Strictly-greater-than, applied per symbol right after its bars are loaded and
+  # BEFORE the engine runs (a filtered stock therefore costs no engine time):
+  #   RELIANCE.NS  price 1,432.00  mcap 950,000 Cr -> scanned
+  #   some penny co   price 63.50  mcap   120 Cr    -> skipped (both filters)
+  # Share count (x last close) = market cap, cached in data/nse_fundamentals.csv;
+  # set either knob to 0 to switch that filter off.
+  min_market_cap_cr: 1000      # ₹ crore — keep only stocks worth more than 1,000 Cr
+  min_price: 100               # ₹ — keep only stocks trading above ₹100
+  keep_unknown_market_cap: true  # no share count available -> scan it anyway
+                                 # (a metadata outage must never swallow alerts)
+  market_cap_cr_overrides: {}  # pin a symbol's ₹ crore when you know better, e.g.
+                               # {TATASTEEL.NS: 95000} — also the offline escape hatch
+  # ---- stop after the scan instead of holding the runner ----
+  # true: `scan` (without --once) does ONE complete pass over the universe,
+  # saves its dedup state and exits. false: keep polling until the close (the
+  # original CI design, which covers the session from a single tick — but it
+  # holds the job for ~6h and queues every later cron tick behind it).
+  exit_after_pass: true
+  # Ceiling for ONE pass (fetch + engine loop). A stalled yahoo download is
+  # abandoned in a daemon thread at this point instead of hanging the job
+  # forever — the hang that made a completed scan look like a stuck scanner.
+  # Set it above a normal full-NSE pass (a few tens of minutes), below the CI
+  # job's own backstop; 0 = no ceiling.
+  max_pass_minutes: 90
   # TAP signal filters (apply to essl_ob_tap composite + footprint_tap ONLY —
   # the 💧 essl_tap level-touch alert is exempt: it fires on every touch of any
   # active eSSL level, fresh or old, footprint TAP or not):
