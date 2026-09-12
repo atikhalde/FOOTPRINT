@@ -408,6 +408,18 @@ Behaviour details:
   a per symbol+event cooldown (default 60 min) prevents spam across *different*
   bars (the one exception is the close-confirmed counterpart of a bar already
   alerted LIVE, see above).
+* **Newest bar wins** — the cooldown is a *spam* guard, so it never lets an
+  older bar silence a newer one. Each cooldown entry remembers the bar that
+  opened it, the `recent_bars` window is walked **newest-first**, and a
+  candidate bar strictly newer than the guarded one is exempt. This matters
+  because `recent_bars: 3` puts several daily bars in one pass: walked
+  oldest-first, the first (oldest) touch of a level opened the 60-minute guard
+  and *today's* touch of that level was dropped as "inside the cooldown of the
+  previous alert" — and since the dedupe key carries the bar stamp, nothing ever
+  retried it, so the actionable signal was lost for the day. Repeats of the
+  *same* bar still collapse into one message, and a state file written before
+  the bar stamp existed is read as "bar unknown", which keeps the old
+  (guarded) behaviour rather than disabling the spam guard.
 * **Stale/lag guards** — symbols whose last bar is older than `max_stale_days`
   *trading* days are skipped (weekends don't count), as are symbols lagging more
   than `max_lag_minutes` behind the live NSE clock. Pre-open (or on a holiday)

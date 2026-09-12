@@ -430,6 +430,16 @@ zone is 685 bars old — it fails against the trimmed implementation.
   `symbol+event+level` so two eSSL levels touched on the same bar both alert, and
   except the confirmed counterpart of a bar that was already alerted LIVE (a
   different dedupe key, so exactly one such follow-up per bar+object, never more).
+* The cooldown also never suppresses a **newer** bar. A cooldown entry stores
+  `{"ts": sent-at, "bar": bar-stamp}`, `scan_symbol` walks the `recent_bars`
+  window newest-first, and `_try_alert` exempts a candidate whose bar stamp is
+  strictly later than the guarded one. Without that, the oldest bar in the
+  window won every time: it opened the 60-minute per-level guard first and the
+  current bar's touch of the same level was dropped — the "scanner runs green
+  but the alert I get is two days old" failure. Bar stamps are the engine's own
+  `Event.date` (fixed-width, zero-padded), so lexicographic order is
+  chronological order within one symbol+interval; an unknown stamp on either
+  side (a pre-upgrade state file) falls back to the old guarded behaviour.
 
 ### 10.3 Scheduling reality
 

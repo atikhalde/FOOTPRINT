@@ -553,7 +553,10 @@ class LiveScanner:
         cooldown = self.state.get("cooldown") or {}
         if len(cooldown) > 5000:
             fresh = (datetime.now() - timedelta(days=2)).isoformat()
-            cooldown = {k: v for k, v in cooldown.items() if v >= fresh}
+            # entries are {"ts":..., "bar":...}; pre-upgrade state files hold a
+            # bare ISO string, and both must survive the prune unchanged
+            cooldown = {k: v for k, v in cooldown.items()
+                        if self._cooldown_stamp(v)[0] >= fresh}
             self.state["cooldown"] = cooldown
         tmp = f"{p}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -561,15 +564,57 @@ class LiveScanner:
         os.replace(tmp, p)         # never leave a half-written state behind
 
     # -- alerting ------------------------------------------------------------
+    @staticmethod
+    def _cooldown_stamp(entry) -> tuple[str, str]:
+        """`(sent_at_iso, bar_time)` for one cooldown map entry.
+
+        Entries are `{"ts": ..., "bar": ...}`. State files written before the
+        bar stamp existed hold a bare ISO string; those are read as
+        "timestamp known, bar unknown" so an upgraded scanner keeps honouring a
+        restored cache instead of re-announcing it.
+        """
+        if isinstance(entry, dict):
+            return str(entry.get("ts") or ""), str(entry.get("bar") or "")
+        return str(entry or ""), ""
+
+    @staticmethod
+    def _bar_is_newer(candidate: str, previous: str) -> bool:
+        """Is `candidate` a strictly later bar than `previous`?
+
+        Bar stamps are the engine's own `Event.date` — `YYYY-MM-DD` on daily
+        bars, `YYYY-MM-DD HH:MM` on intraday ones. Both are fixed-width and
+        zero-padded, so lexicographic order IS chronological order within one
+        symbol+interval (the only pairing this is ever asked about). An unknown
+        stamp on either side answers False: without both stamps there is no
+        evidence that this is fresher news, so the spam guard stays as it was.
+        """
+        if not candidate or not previous:
+            return False
+        return candidate > previous
+
     def _try_alert(self, sym: str, kind: str, message: str, dedup_key: str,
                    cooldown_key: str | None = None,
-                   follow_up_of: str | None = None) -> bool:
+                   follow_up_of: str | None = None,
+                   bar_time: str | None = None) -> bool:
         """Send one alert unless it was already sent or is inside its cooldown.
 
         `cooldown_key` defaults to `symbol|kind` (one stream per event type).
         Callers pass a finer key when several *distinct objects* of the same
         kind are alertable at once — e.g. two different eSSL levels touched on
         the same bar — so one level's alert cannot swallow the other's.
+
+        `bar_time` is the stamp of the bar this alert is about. The cooldown is
+        a SPAM guard, and spam means "the same story repeated" — it must never
+        let an OLD bar silence a NEWER one. That mattered on the shipped daily
+        setup: `recent_bars: 3` admits three daily bars per pass and they were
+        walked oldest-first, so the first (oldest) touch of a level opened the
+        60-minute guard and today's touch of the same level — the only one that
+        is actionable — was dropped with "inside the cooldown of the previous
+        alert". Because the dedup key does carry the bar stamp, nothing ever
+        re-tried it either: the newest bar's signal was lost for the day. So a
+        candidate bar strictly newer than the bar that opened the cooldown is
+        exempt from it. Distinct bars still each get at most one message (that
+        is the dedup key's job), so this cannot turn into a stream.
 
         `follow_up_of` is the dedup key of the *provisional* (LIVE) alert this
         message is the confirmed counterpart of. The LIVE alert is a guess made
@@ -590,10 +635,13 @@ class LiveScanner:
             self._note_suppressed(sym, kind, "already alerted (dedup state)")
             return False
         cd_key = cooldown_key or f"{sym}|{kind}"
-        last = self.state["cooldown"].get(cd_key)
-        if last and not (follow_up_of and follow_up_of in self.state["alerted"]):
+        last_ts, last_bar = self._cooldown_stamp(self.state["cooldown"].get(cd_key))
+        is_follow_up = bool(follow_up_of and follow_up_of in self.state["alerted"])
+        # a newer bar is newer NEWS, not a repeat of the guarded one
+        newer_bar = self._bar_is_newer(bar_time or "", last_bar)
+        if last_ts and not is_follow_up and not newer_bar:
             try:
-                if now - datetime.fromisoformat(last) < timedelta(minutes=sc.alert_cooldown_minutes):
+                if now - datetime.fromisoformat(last_ts) < timedelta(minutes=sc.alert_cooldown_minutes):
                     self._bump("suppressed_cooldown")
                     self._note_suppressed(sym, kind, f"inside the {sc.alert_cooldown_minutes:g}-min "
                                                      "cooldown of the previous alert")
@@ -607,7 +655,8 @@ class LiveScanner:
             # touch the persisted state file — previewing must not consume
             # live alerts.
             self.state["alerted"][dedup_key] = now.isoformat()
-            self.state["cooldown"][cd_key] = now.isoformat()
+            self.state["cooldown"][cd_key] = {"ts": now.isoformat(),
+                                              "bar": bar_time or ""}
             self._bump("alerts")
             if not self.cfg.telegram.dry_run:
                 self._save_state()
@@ -759,7 +808,12 @@ class LiveScanner:
             else:
                 d["other"].append(ev)
 
-        for date, d in sorted(by_bar.items()):
+        # Newest bar FIRST. The `recent_bars` window can hold several bars that
+        # each touched the same level, and the newest one is the only one the
+        # user can still act on — so it is offered to Telegram before any older
+        # bar can open the per-level cooldown (see `_try_alert`). Walking the
+        # window oldest-first is what let a two-day-old touch swallow today's.
+        for date, d in sorted(by_bar.items(), reverse=True):
             composite_bar = d["tap"] is not None and d["essl"] is not None
             # Set when the composite message went out (this pass or an earlier
             # one): only that one eSSL level is skipped below, because its
@@ -787,7 +841,8 @@ class LiveScanner:
                         follow_up = (f"{sym}|{cfg.data.interval}|essl_ob_tap|{date}|False|"
                                      f"{tap.zone_id}|{essl.pool_id}" if tap.confirmed else None)
                         if self._try_alert(sym, "essl_ob_tap", msg, key,
-                                           follow_up_of=follow_up):
+                                           follow_up_of=follow_up,
+                                           bar_time=date):
                             sent += 1
                             covered = True
                         if covered:
@@ -854,7 +909,7 @@ class LiveScanner:
                 follow_up = (f"{sym}|{cfg.data.interval}|{kind}|{date}|False|{obj}"
                              if ev.confirmed else None)
                 if self._try_alert(sym, kind, msg, key, cooldown_key=cd,
-                                   follow_up_of=follow_up):
+                                   follow_up_of=follow_up, bar_time=date):
                     sent += 1
         return sent
 
