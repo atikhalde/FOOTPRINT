@@ -537,6 +537,177 @@ def test_fmgoetze_reclaim_alerts_live_and_at_the_close():
           "(LIVE tap + close-confirmed RECLAIMED ✅ on 432.65, 445.65 only as a break)")
 
 
+# ---------------------------------------------------------------------------
+# 12. The cooldown is a SPAM guard, not a recency filter: an OLDER bar in the
+#     `recent_bars` window must never silence a NEWER touch of the same level.
+#     This is the regression behind "the scanner stopped sending valid alerts"
+#     on the shipped daily setup. `recent_bars: 3` admits several bars per pass
+#     and they used to be walked oldest-first, so the first (oldest) touch
+#     opened the 60-minute per-level guard and the newest touch — the only one
+#     still actionable — was dropped with "inside the cooldown of the previous
+#     alert". The dedup key carries the bar stamp, so nothing ever retried it
+#     either: the newest bar's signal was simply lost for the day.
+#     Fixture: eSSL 257.7 is touched on bar 1013 (12:30) AND bar 1014 (12:45)
+#     of the same session, so both sit inside a 2-bar window.
+# ---------------------------------------------------------------------------
+BAR_REPEAT_A = 1013
+BAR_REPEAT_B = 1014
+
+
+def _repeat_level(df: pd.DataFrame) -> float:
+    evs = essl_touch_events(df, BAR_REPEAT_A)
+    assert len(evs) == 1, [e.pool_id for e in evs]
+    again = essl_touch_events(df, BAR_REPEAT_B)
+    assert len(again) == 1, [e.pool_id for e in again]
+    assert evs[0].pool_id == again[0].pool_id, (evs[0].pool_id, again[0].pool_id)
+    return float(evs[0].price)
+
+
+def _two_pass_repeat(cfg: AppConfig, df: pd.DataFrame):
+    """Pass 1 ends on the older touch, pass 2 on the newer one (same scanner)."""
+    _restore()
+    rec = Recorder()
+    sc = scanner.LiveScanner(cfg, rec, symbols=[SYM])
+    scanner.load_symbol = lambda sym, d: df.iloc[: BAR_REPEAT_A + 1]
+    scanner.market_now = lambda c: (df.index[BAR_REPEAT_A]
+                                    + timedelta(minutes=5)).to_pydatetime()
+    try:
+        first = sc.scan_symbol(SYM)
+        scanner.load_symbol = lambda sym, d: df.iloc[: BAR_REPEAT_B + 1]
+        scanner.market_now = lambda c: (df.index[BAR_REPEAT_B]
+                                        + timedelta(minutes=5)).to_pydatetime()
+        second = sc.scan_symbol(SYM)
+    finally:
+        _restore()
+    return first, second, sc, rec
+
+
+def test_newer_bar_not_swallowed_by_older_bars_cooldown():
+    df = gen_intraday()
+    level = _repeat_level(df)
+    stamp_a = df.index[BAR_REPEAT_A].strftime("%Y-%m-%d %H:%M")
+    stamp_b = df.index[BAR_REPEAT_B].strftime("%Y-%m-%d %H:%M")
+    first, second, sc, rec = _two_pass_repeat(mk_cfg(recent_bars=2, **SHIPPED_FILTERS), df)
+    # pass 1: the older touch alerts and opens the per-level cooldown
+    assert first == 1, (first, rec.kinds)
+    # pass 2, minutes later: the window holds BOTH bars and the 60-min guard is
+    # wide open. The NEWER bar is news, so its touch must still be delivered.
+    assert second >= 1, (second, rec.kinds, sc.suppressed_examples)
+    newest = [m for m in rec.messages if stamp_b in m and f"eSSL level <b>{level:g}</b>" in m]
+    assert newest, (stamp_b, level, [m.splitlines()[1] for m in rec.messages])
+    # the guard now records WHICH BAR opened it, which is what makes the
+    # exemption above evidence-based rather than a blanket bypass
+    pool = int(essl_touch_events(df, BAR_REPEAT_A)[0].pool_id)
+    cd = sc.state["cooldown"][f"{SYM}|essl_tap|{pool}"]
+    assert scanner.LiveScanner._cooldown_stamp(cd)[1] in (stamp_a, stamp_b), cd
+    print("ok test_newer_bar_not_swallowed_by_older_bars_cooldown "
+          "(level %g: %s alerts, then %d more; the %s touch arrived)"
+          % (level, first, second, stamp_b[-5:]))
+
+
+def test_cold_start_reports_the_newest_bar_not_the_stale_one():
+    """One cold pass over a window holding two touches of one level.
+
+    Both bars are new to the state file, so dedup cannot separate them — only
+    the ordering + the bar stamp can. The newest bar must be the one delivered:
+    before the fix the window was walked oldest-first, so a two-day-old touch
+    opened the guard and today's touch was dropped as "inside the cooldown of
+    the previous alert". That is the "not receiving a valid alert" symptom.
+    """
+    df = gen_intraday()
+    level = _repeat_level(df)
+    stamp_a = df.index[BAR_REPEAT_A].strftime("%Y-%m-%d %H:%M")
+    stamp_b = df.index[BAR_REPEAT_B].strftime("%Y-%m-%d %H:%M")
+    _restore()
+    rec = Recorder()
+    sc = scanner.LiveScanner(mk_cfg(recent_bars=2, **SHIPPED_FILTERS), rec, symbols=[SYM])
+    scanner.load_symbol = lambda sym, d: df.iloc[: BAR_REPEAT_B + 1]
+    scanner.market_now = lambda c: (df.index[BAR_REPEAT_B]
+                                    + timedelta(minutes=5)).to_pydatetime()
+    try:
+        sent = sc.scan_symbol(SYM)
+    finally:
+        _restore()
+    assert sent == 1, (sent, rec.kinds)
+    assert stamp_b in rec.messages[0] and stamp_a not in rec.messages[0], \
+        [m.splitlines()[1] for m in rec.messages]
+    assert sc.stats["suppressed_cooldown"] == 1, sc.stats
+    print("ok test_cold_start_reports_the_newest_bar_not_the_stale_one "
+          "(sent %s, suppressed the %s bar)" % (stamp_b[-5:], stamp_a[-5:]))
+
+
+def test_same_bar_still_collapses_into_one_alert():
+    """The guard still does its actual job: repeats of the SAME bar stay silent.
+
+    Exempting newer bars must not switch the cooldown off. Re-running the very
+    pass that just alerted has to produce nothing at all.
+    """
+    df = gen_intraday()
+    _repeat_level(df)
+    _restore()
+    rec = Recorder()
+    sc = scanner.LiveScanner(mk_cfg(recent_bars=2, **SHIPPED_FILTERS), rec, symbols=[SYM])
+    scanner.load_symbol = lambda sym, d: df.iloc[: BAR_REPEAT_B + 1]
+    scanner.market_now = lambda c: (df.index[BAR_REPEAT_B]
+                                    + timedelta(minutes=5)).to_pydatetime()
+    try:
+        first = sc.scan_symbol(SYM)
+        again = sc.scan_symbol(SYM)          # identical pass, nothing is newer
+        and_again = sc.scan_symbol(SYM)
+    finally:
+        _restore()
+    assert first == 1, (first, rec.kinds)
+    assert (again, and_again) == (0, 0), (again, and_again, rec.kinds)
+    assert len(rec.messages) == 1, rec.messages
+    print("ok test_same_bar_still_collapses_into_one_alert "
+          "(%d alert, then %d/%d on repeat passes)" % (first, again, and_again))
+
+
+# ---------------------------------------------------------------------------
+# 13. Bar-stamp comparison: the exemption is evidence-based, so an unknown
+#     stamp (a state file written before it existed) keeps the old behaviour
+#     instead of silently disabling the spam guard.
+# ---------------------------------------------------------------------------
+def test_bar_stamp_comparison_and_legacy_state():
+    newer = scanner.LiveScanner._bar_is_newer
+    assert newer("2026-09-11", "2026-09-09") is True
+    assert newer("2026-09-09", "2026-09-11") is False
+    assert newer("2026-09-09", "2026-09-09") is False          # same bar: guarded
+    assert newer("2026-09-11 09:30", "2026-09-11 09:15") is True
+    assert newer("2026-09-11", "") is False                    # unknown -> guarded
+    assert newer("", "2026-09-09") is False
+    # a pre-upgrade state file holds bare ISO strings; both readers agree
+    ts, bar = scanner.LiveScanner._cooldown_stamp("2026-09-11T10:00:00")
+    assert ts == "2026-09-11T10:00:00" and bar == "", (ts, bar)
+    ts2, bar2 = scanner.LiveScanner._cooldown_stamp(
+        {"ts": "2026-09-11T10:00:00", "bar": "2026-09-11"})
+    assert (ts2, bar2) == ("2026-09-11T10:00:00", "2026-09-11"), (ts2, bar2)
+    assert scanner.LiveScanner._cooldown_stamp(None) == ("", "")
+    print("ok test_bar_stamp_comparison_and_legacy_state")
+
+
+def test_legacy_cooldown_entry_still_suppresses():
+    """A restored cache written before the bar stamp must still guard."""
+    from datetime import datetime as _dt
+    df = gen_intraday()
+    pool = essl_touch_events(df, BAR_REPEAT_A)[0].pool_id
+    cfg = mk_cfg(recent_bars=2, **SHIPPED_FILTERS)
+    _restore()
+    rec = Recorder()
+    sc = scanner.LiveScanner(cfg, rec, symbols=[SYM])
+    sc.state["cooldown"][f"{SYM}|essl_tap|{pool}"] = _dt.now().isoformat()  # legacy form
+    scanner.load_symbol = lambda sym, d: df.iloc[: BAR_REPEAT_A + 1]
+    scanner.market_now = lambda c: (df.index[BAR_REPEAT_A]
+                                    + timedelta(minutes=5)).to_pydatetime()
+    try:
+        sent = sc.scan_symbol(SYM)
+    finally:
+        _restore()
+    assert sent == 0, (sent, rec.messages)
+    assert sc.stats["suppressed_cooldown"] == 1, sc.stats
+    print("ok test_legacy_cooldown_entry_still_suppresses")
+
+
 ALL = [
     test_touch_without_footprint_tap_alerts,
     test_old_essl_level_touch_alerts,
@@ -549,6 +720,11 @@ ALL = [
     test_shipped_config_enables_essl_tap,
     test_break_bar_never_alerts_a_touch,
     test_fmgoetze_reclaim_alerts_live_and_at_the_close,
+    test_newer_bar_not_swallowed_by_older_bars_cooldown,
+    test_cold_start_reports_the_newest_bar_not_the_stale_one,
+    test_same_bar_still_collapses_into_one_alert,
+    test_bar_stamp_comparison_and_legacy_state,
+    test_legacy_cooldown_entry_still_suppresses,
 ]
 
 

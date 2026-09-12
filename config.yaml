@@ -58,7 +58,12 @@ scanner:
                              # (the close-confirmed follow-up of the SAME bar is exempt from the
                              # cooldown below — on a daily bar it always lands inside the window, and
                              # it is the state the indicator shows at the close, e.g. RECLAIMED ✅)
-  alert_cooldown_minutes: 60 # per symbol+event-type spam guard (across different bars)
+  alert_cooldown_minutes: 60 # per symbol+event-type spam guard (across different bars).
+                             # It never suppresses a NEWER bar: the recent_bars window is
+                             # walked newest-first and each cooldown entry remembers the bar
+                             # that opened it, so today's touch of a level is not swallowed
+                             # by an older bar's alert. Repeats of the SAME bar still
+                             # collapse into one message.
   min_bars: 600          # skip symbols with less history (ATR/MA/pivot/SSL/pool warmup)
   stop_after_close_minutes: 15   # keep polling this long past 15:30 IST for the closing bar
   preopen_wait_minutes: 180      # started up to this far before the open -> wait for the
