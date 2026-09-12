@@ -501,3 +501,61 @@ session is open plus a settle buffer, `poll_minutes: 15` paces the pass, and
 the confirmed follow-up for the closing bar fires on the next trading day
 inside `recent_bars`. The stale/lag guards stay, and weekends count as zero
 trading days.
+
+## 12. Why the scanner went silent, and what now guarantees delivery (2026-09-11)
+
+"Alerts stopped arriving after PR #13" was investigated end to end — replaying a
+whole CI scanner day offline (stubbed `yfinance`, a local Telegram endpoint, the
+real `config.yaml`, the persisted dedup state across 12 passes). **The signal
+engine, the LIVE/confirmed pairing, the cooldowns and the dedup state all
+behaved correctly**, so the silence was not an indicator bug. Five separate
+operational faults were responsible, and each is now fixed and pinned by a test
+in `tests/test_alert_delivery.py`:
+
+1. **Session coverage.** `scanner.exit_after_pass: true` made one trigger worth
+   exactly one pass, and GitHub delivered 2 of ~80 scheduled ticks that day —
+   both *after* the 15:30 IST close. So the session was never scanned while it
+   was live, and every after-hours pass correctly found nothing new (the day's
+   alerts were already in the dedup state). Shipped default back to
+   `exit_after_pass: false` (one run = the session worker), the cron window
+   broadened, and `scanner.reschedule_in_ci` added: a run that stops while the
+   market day is still live dispatches **one** successor, so the chain — not
+   Actions cron — guarantees coverage. Cancels and dry runs never re-arm, and
+   `reschedule_max_runs_per_day` caps the chain.
+2. **Telegram flood control.** A full-universe pass fires dozens of taps in the
+   same second; Telegram accepts ~1 message/second per chat and answers the rest
+   with `429`. The notifier used to fire back-to-back and drop any rejected send,
+   so the run reported success while the chat stayed empty. It now paces
+   (`telegram.min_interval_sec`), honours `retry_after`, retries 5xx/network
+   errors, re-sends as escaped plain text if the HTML is rejected, trims long
+   messages on a tag boundary, and counts everything (`sent/throttled/failed`).
+   A failed send does not record its dedup key, so the alert is retried next
+   pass — at-least-once instead of silently lost.
+3. **A dry run consumed live alerts.** `run_forever()`'s exit path saved state
+   unconditionally, so a `--dry-run` preview recorded its printed keys and the
+   next *live* pass believed they had been delivered and swallowed them.
+   `_save_state()` now refuses to write during a dry run (atomic temp+rename
+   write, bounded cooldown map, and state pruning along the way).
+4. **One stalled pass ended the whole day.** `scan_once()` called
+   `request_stop()` when the batched yahoo fetch hit `max_pass_minutes`, which
+   broke the polling loop — a 10-minute feed hiccup at 09:30 therefore killed
+   the session worker, and the next tick was however long GitHub took. A
+   data-less pass is now retried on the next poll; only
+   `scanner.max_pass_failures` consecutive ones give up. A batch that returns
+   nothing for a large universe no longer fans out into one sequential request
+   per ticker (that burned the entire job timeout against a dead endpoint).
+5. **The pass ceiling starved the tail of the universe.** The universe list is
+   alphabetical and the ceiling cut every pass at the same position, so symbols
+   after the cut could *never* alert. The scan order now resumes from a cursor
+   persisted in the state file (`scanner.rotate_universe`). Staleness, meanwhile,
+   is measured against the **market's** newest bar instead of the wall clock, so
+   an NSE holiday longer than `max_stale_days` no longer drops the entire
+   universe (a genuinely delisted ticker still lags the market and is skipped).
+
+**Every run is now self-explaining.** `state/scan_report.json` (and the
+*Scanner run report* block in the Actions job summary) separates the three
+things that all look like "no alert": nothing to say (`scanned` healthy,
+`alerts 0`), nothing to scan (`no_bars`/`filtered`/`skipped_stale`, or a failed
+pass), and said-but-not-delivered (`telegram: N sent / throttled / failed`) —
+plus what was suppressed by dedup or cooldown, with examples, and whether the
+run re-armed a successor.

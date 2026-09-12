@@ -9,30 +9,44 @@ name: Scanner
 # TradingView indicator. Each internal poll fetches the whole universe in one
 # paced batch, then runs the engine over every symbol.
 #
-# Reliability design: GitHub's `schedule` trigger is best-effort — ticks are
-# delayed by 5-30 min under load and high-frequency ticks are regularly
-# dropped (this repo's history: 1 scheduled tick out of ~16 expected). So the
-# workflow does NOT need a tick every 5 minutes. Each tick starts ONE job that
-# polls internally until the close (`python -m fpfssl scan`), and the
-# `concurrency` group keeps a single scanner running: a tick that arrives while
-# a session job is running simply becomes the next queued run and takes over
-# when that job ends. Any single tick that fires near/inside the session now
-# covers the whole session.
+# Reliability design — why a run POLLS instead of doing one pass and exiting:
+# GitHub's `schedule` trigger is best-effort. Ticks are delayed by 5-60+ min
+# under load and whole hours of them are dropped; on a session day this repo
+# received 2 of ~80 expected ticks and BOTH arrived after the market close. A
+# job that maps "one tick -> one 10-minute pass" therefore spends the session
+# scanning nothing and the chat receives no alert (that is what "the scanner
+# stopped alerting" actually was). So:
 #
-# Stopping it (four layers now; the first three were broken / missing before):
-#   0. `scanner.exit_after_pass: true` — the run ends by itself as soon as the
-#      pass is complete. Nothing has to be cancelled at all in the default mode.
+#   1. one tick starts ONE session worker (`python -m fpfssl scan`), which polls
+#      every `scanner.poll_minutes` until the close + settle window;
+#   2. if that worker is cut before the session ends (runtime budget, a stalled
+#      feed, the pass ceiling), it dispatches exactly one successor run through
+#      the Actions API (`scanner.reschedule_in_ci`, see fpfssl/ci.py) — the chain
+#      keeps the market covered without depending on cron;
+#   3. the `concurrency` group keeps a single scanner running; a tick that lands
+#      while a session job runs becomes the queued successor, and a queued run
+#      superseded by a newer tick is dropped (harmless — the worker is already
+#      covering the session);
+#   4. every pass ends on its own terms (never killed mid-pass) and saves its
+#      dedup state, so a resumed run cannot re-announce an alert.
+#
+# Stopping it (four layers; the first three were broken / missing historically):
+#   0. The run ends by itself at the close + `stop_after_close_minutes`, or at
+#      its `--max-runtime-minutes` budget, whichever comes first.
 #   1. "Cancel workflow" in the Actions UI — the scanner installs its own
 #      SIGINT/SIGTERM handlers, so it stops within a second, saves its dedup
-#      state and exits. (It used to inherit SIGINT as SIG_IGN from the runner's
-#      non-interactive shell, so cancel was silently swallowed for hours.)
-#   2. It always ends on its own: at the close (15:30 IST + 15 min settle) or
-#      at its `--max-runtime-minutes` budget — below the job's timeout, so the
-#      runner never has to kill a pass.
+#      state and exits (and a cancelled run does NOT re-arm itself).
+#   2. `timeout` in the Scan step: SIGTERM, SIGKILL 5 minutes later. Nothing can
+#      run forever.
 #   3. Pause the schedule without touching this file: set the repository
 #      variable SCANNER_ENABLED=false (Settings → Secrets and variables →
 #      Actions → Variables). Scheduled ticks then exit immediately; manual
 #      `workflow_dispatch` runs still work.
+#
+# If a run is green but nothing arrives in the chat, open its job summary: the
+# `scan_report.json` block states how many symbols were scanned/filtered, how
+# many alerts were sent, how many were suppressed by dedup/cooldown and whether
+# Telegram throttled the delivery — "no alerts" is never ambiguous again.
 # ---------------------------------------------------------------------------
 on:
   push:
@@ -41,8 +55,13 @@ on:
       - 'fpfssl/**'
       - 'config.yaml'
   schedule:
-    # Every 10 min from 03:00 to 10:50 UTC (= 08:30-16:20 IST).
-    - cron: '*/10 3-10 * * 1-5'
+    # Every 15 min from 03:00 to 10:45 UTC (= 08:30-16:15 IST). A session is
+    # covered by whichever tick arrives, so the cadence only decides how early
+    # the worker starts — not whether the session is scanned at all.
+    - cron: '*/15 3-10 * * 1-5'
+    # Late sweeps: when the whole session window is starved, these still land
+    # inside/after the close and deliver the confirmed verdict for the day.
+    - cron: '40 10,11 * * 1-5'
   repository_dispatch:
     types: [scan]          # external scheduler hook (cron-job.org etc.)
   workflow_dispatch:
@@ -52,13 +71,21 @@ on:
         type: boolean
         default: false
       once:
-        description: Single scan pass (default = config.yaml, i.e. one pass then exit)
+        description: "Single scan pass, then exit (default: poll until the close)"
         type: boolean
         default: false
       poll_session:
-        description: Poll until the market close instead of exiting after one pass
+        description: Force session polling even if config.yaml says exit_after_pass
         type: boolean
         default: false
+      reschedule:
+        description: "Allow this run to re-arm a successor while the session lives"
+        type: choice
+        options:
+          - auto           # follow config.yaml scanner.reschedule_in_ci
+          - 'yes'
+          - 'no'
+        default: auto
       symbols:
         description: Comma-separated tickers (blank uses config.yaml)
         type: string
@@ -70,6 +97,9 @@ on:
 
 permissions:
   contents: read
+  # needed ONLY for the self re-arm (one successor workflow_dispatch per run);
+  # remove it and the scanner still runs, it just cannot extend the session
+  actions: write
 
 concurrency:
   # one live scanner at a time; queued ticks back each other up
@@ -78,20 +108,29 @@ concurrency:
 
 jobs:
   scan:
-    # SCANNER_ENABLED=false pauses the 10-minute schedule (see header) without
-    # deleting the cron or blocking a manual dispatch.
+    # SCANNER_ENABLED=false pauses the schedule (see header) without deleting
+    # the cron or blocking a manual dispatch.
     if: github.event_name != 'schedule' || vars.SCANNER_ENABLED != 'false'
     runs-on: ubuntu-latest
-    # hard cap below GitHub's 6h job limit: the poller exits at the close, and
-    # a queued tick takes over if this job is cut off near the end of the day
-    timeout-minutes: 350
+    # hard cap above the scanner's own budget (280 min) + the post-scan steps;
+    # below GitHub's 6h per-job limit so the runner never kills a pass
+    timeout-minutes: 330
     env:
       # Push runs are offline smoke tests; scheduled/dispatched runs are real.
       DRY_RUN: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
-      ONCE: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.once) }}
+      # A preview should not sit in a runner polling until the close: dry runs do
+      # one pass unless session polling was asked for explicitly.
+      ONCE: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.once || (inputs.dry_run && !inputs.poll_session))) }}
       POLL_SESSION: ${{ github.event_name == 'workflow_dispatch' && inputs.poll_session }}
+      RESCHEDULE: ${{ github.event_name == 'workflow_dispatch' && inputs.reschedule || 'auto' }}
       SYMBOLS: ${{ inputs.symbols }}
       INTERVAL: ${{ inputs.interval }}
+      # what a re-armed successor run replays (see fpfssl/ci.py::_env_inputs)
+      FPFSSL_REARM_INPUTS: >-
+        {"poll_session": ${{ github.event_name == 'workflow_dispatch' && inputs.poll_session || 'true' }},
+         "symbols": "${{ inputs.symbols }}", "interval": "${{ inputs.interval }}"}
+      FPFSSL_WORKFLOW: scanner.yml
+      FPFSSL_REF: ${{ github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -100,15 +139,31 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.txt
 
+      # Each suite is bounded and reported separately, with its FAIL/ERROR lines
+      # emitted as check annotations. A red X with no explanation is how "the
+      # scanner sends nothing" stayed invisible for a day: Actions logs are not
+      # always reachable (and a hung suite would have held the job until the
+      # step timeout), so the failure has to arrive in the checks UI by itself.
       - name: Engine + live-path tests
+        shell: bash
         run: |
-          python tests/test_engine.py
-          python tests/test_fidelity_live.py
-          python tests/test_live_scanner.py
-          python tests/test_tap_filters.py
-          python tests/test_essl_touch_alerts.py
-          python tests/test_universe.py
-          python tests/test_size_filters.py
+          status=0
+          for t in test_engine test_fidelity_live test_live_scanner test_tap_filters \
+                   test_essl_touch_alerts test_universe test_size_filters test_alert_delivery; do
+            echo "::group::$t"
+            out=$(timeout 20m python "tests/$t.py" 2>&1); rc=$?
+            printf '%s\n' "$out" | tail -n 45
+            if [[ $rc -ne 0 ]]; then
+              status=1
+              detail=$(printf '%s\n' "$out" | grep -E '^(FAIL|ERROR)' | head -n 4 \
+                       | tr '\n' ' ' | tr -d '\r' | cut -c1-700)
+              [[ -n "$detail" ]] || detail="(no FAIL line — exit $rc; likely a crash or the 20m timeout)"
+              detail="${detail//%/ %25}"
+              echo "::error file=tests/$t.py::$t failed: $detail"
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
 
       - name: Restore alert deduplication state
         if: env.DRY_RUN != 'true'
@@ -138,6 +193,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # only used to queue the successor run (see scanner.reschedule_in_ci)
+          GITHUB_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           args=(scan)
@@ -147,6 +204,10 @@ jobs:
           if [[ "$POLL_SESSION" == "true" ]]; then
             args+=(--keep-polling)      # ignore config.yaml's exit_after_pass
           fi
+          case "$RESCHEDULE" in
+            no)  args+=(--no-reschedule) ;;
+            yes) args+=(--reschedule) ;;
+          esac
           if [[ "$DRY_RUN" == "true" ]]; then
             args+=(--dry-run)
           elif [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
@@ -155,10 +216,10 @@ jobs:
           else
             args+=(--no-dry-run)   # config.yaml telegram.dry_run cannot silence CI
             # Wall-clock budget: the poller saves its dedup state and exits on
-            # its own well before the job's timeout-minutes, so the runner
-            # never has to kill a half-finished pass. The next queued tick
-            # (cron fires every 10 min) picks the session back up.
-            args+=(--max-runtime-minutes 325)
+            # its own well before the job's timeout-minutes, so the runner never
+            # has to kill a half-finished pass. A run that stops early re-arms a
+            # successor; the queued cron ticks are only a backstop.
+            args+=(--max-runtime-minutes 280)
           fi
           if [[ "${{ github.event_name }}" == "push" ]]; then
             args+=(--source synthetic --symbols RELIANCE.NS --interval 15m)
@@ -173,7 +234,27 @@ jobs:
           # Hard backstop under `timeout-minutes`: if the poller ever cannot
           # exit by itself, SIGTERM (handled: saves state, exits) and then
           # SIGKILL 5 minutes later. Nothing can run forever.
-          timeout --signal=TERM --kill-after=5m 335m python -m fpfssl "${args[@]}"
+          timeout --signal=TERM --kill-after=5m 300m python -m fpfssl "${args[@]}"
+
+      # The scanner's own verdict, published where a human looks first. This is
+      # the step that answers "why no alert?" without reading 400 lines of log:
+      # universe scanned vs filtered, alerts sent, dedup/cooldown suppressions,
+      # Telegram delivery counters, and why the run stopped.
+      - name: Scan report
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Scanner run report"
+            echo ''
+            if [[ -f state/scan_report.json ]]; then
+              echo '```json'
+              cat state/scan_report.json
+              echo '```'
+            else
+              echo '_No `state/scan_report.json`: the run stopped before finishing a pass. The Scan step log above is authoritative._'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Why (no) alert? — live state per symbol
         # `always()` but NOT after a cancel: this step re-fetches the whole
@@ -183,10 +264,10 @@ jobs:
         # Hard-bounded on purpose. This step is what used to hang the job after
         # the scan had already finished: `diagnose` over `full_nse` re-downloads
         # every symbol and runs the engine over its whole history, with nothing
-        # watching the clock. `--max-symbols` + `--bars` bound the engine work,
-        # the size filters drop the rest before it runs (a filtered symbol gets a
-        # verdict line, no engine pass), and `timeout` is the backstop that
-        # guarantees the step (and therefore the job) ends.
+        # watching the clock. `--max-symbols` bounds the engine work, the size
+        # filters drop the rest before it runs (a filtered symbol gets a verdict
+        # line, no engine pass), and `timeout` guarantees the step (and
+        # therefore the job) ends.
         if: always() && !cancelled()
         shell: bash
         run: |
@@ -206,21 +287,26 @@ jobs:
                 args+=(--interval "$INTERVAL")
               fi
             fi
-            timeout --signal=TERM --kill-after=2m 20m \
+            timeout --signal=TERM --kill-after=2m 15m \
               python -m fpfssl "${args[@]}" 2>&1 | tail -n +2 \
               || echo '(diagnostics stopped early or failed — the scan step above is authoritative)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" || true
 
       - name: Save alert deduplication state
-        if: always() && env.DRY_RUN != 'true'
+        # `hashFiles` guard: without it, a run that never reached the scan (a
+        # failing test step, a cancel before the restore) would publish an EMPTY
+        # state cache and the next run would start with no memory — re-alerting
+        # the whole session, or (worse, if the empty entry wins) re-alerting and
+        # then swallowing the same keys again.
+        if: always() && env.DRY_RUN != 'true' && hashFiles('state/scanner_state.json') != ''
         uses: actions/cache/save@v4
         with:
           path: state/scanner_state.json
           key: scanner-state-main-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Save universe + fundamentals cache
-        if: always()
+        if: always() && hashFiles('data/nse_universe.csv') != ''
         uses: actions/cache/save@v4
         with:
           path: |
