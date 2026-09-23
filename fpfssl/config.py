@@ -174,14 +174,19 @@ class DataConfig:
 class ScannerConfig:
     poll_minutes: float = 15.0           # daily cadence (intraday TFs can go lower)
     state_file: str = "state/scanner_state.json"
+    # Shipped live set (config.yaml) is footprint_tap + essl_tap only. The
+    # composite and the other events stay implemented; add them back to the
+    # list to re-enable. Defaults here match that shipped set so a run that
+    # does not override the key cannot re-open the muted channels.
     alert_events: list[str] = field(default_factory=lambda: [
-        "essl_ob_tap",    # composite: eSSL tap on a bar where a footprint TAP also fires (ALL RULES)
+        "footprint_tap",  # Footprint TAP 1 (tap_first_only) — normal notification
         "essl_tap",       # price TOUCHED an active eSSL level (fresh or old; no footprint TAP needed)
-        "essl_sweep",     # confirmed eSSL sweep / gap reclaim (liquidity grab + reclaim)
-        "footprint_tap",  # source-compatible TAP on any confirmed FP-OB
-        "defence",        # source defence confirmation after a TAP
-        "zone_invalid",   # zone invalidated (stop) or touch limit exceeded
-        "essl_created",   # new eSSL reference published (fresh major low)
+    ])
+    # Events delivered with Telegram disable_notification. The message text,
+    # the rules and the dedup are unchanged — only the phone stays quiet.
+    # Footprint TAP 1 is not in this list.
+    silent_alert_events: list[str] = field(default_factory=lambda: [
+        "essl_tap",
     ])
     provisional_alerts: bool = True      # also alert on the still-forming bar (marked LIVE)
     alert_cooldown_minutes: float = 60.0

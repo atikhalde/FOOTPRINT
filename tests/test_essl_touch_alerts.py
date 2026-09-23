@@ -331,16 +331,107 @@ def test_engine_taps_old_level_live_and_confirmed():
     print(f"ok test_engine_taps_old_level_live_and_confirmed (pool #{pool_id}, age {age})")
 
 
+class FlagRecorder:
+    """Records `(text, silent)` so delivery sound can be asserted separately
+    from the message body."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, bool]] = []
+
+    def send(self, text: str, silent: bool = False) -> bool:
+        self.calls.append((text, bool(silent)))
+        return True
+
+    @property
+    def messages(self) -> list[str]:
+        return [t for t, _ in self.calls]
+
+
+def _scan_with(df: pd.DataFrame, end_bar: int, cfg: AppConfig, rec) -> int:
+    _restore()
+    frame = df.iloc[: end_bar + 1]
+    now = (df.index[end_bar] + timedelta(minutes=5)).to_pydatetime()
+    sc = scanner.LiveScanner(cfg, rec, symbols=[SYM])
+    scanner.load_symbol = lambda sym, d: frame
+    scanner.market_now = lambda c: now
+    try:
+        return sc.scan_symbol(SYM)
+    finally:
+        _restore()
+
+
+def test_shipped_essl_tap_is_silent_and_the_text_is_unchanged():
+    """The eSSL touch still says exactly what it said; only the sound is off."""
+    df = gen_intraday()
+    evs = essl_touch_events(df, BAR_TOUCH_ONLY)
+    assert len(evs) == 1 and not tap_events(df, BAR_TOUCH_ONLY)
+    cfg = mk_cfg(alert_events=["footprint_tap", "essl_tap"],
+                 silent_alert_events=["essl_tap"], **SHIPPED_FILTERS)
+    rec = FlagRecorder()
+    sent = _scan_with(df, BAR_TOUCH_ONLY, cfg, rec)
+    assert sent == 1 and len(rec.calls) == 1, rec.messages
+    text, silent = rec.calls[0]
+    assert silent is True, rec.calls
+    assert "eSSL TAP — price touched the eSSL level" in text, text
+    assert f"eSSL level <b>{evs[0].price:g}</b>" in text, text
+    assert "no footprint TAP required" in text, text
+    assert "ALL RULES MATCH" not in text
+    assert "Footprint TAP" not in text
+    print("ok test_shipped_essl_tap_is_silent_and_the_text_is_unchanged")
+
+
+def test_shipped_footprint_tap1_stays_audible_and_composite_stays_off():
+    """TAP 1 on a young OB still alerts, with a notification. The composite
+    does not, even on a bar where both halves fired."""
+    from test_engine import composite_rows, make_df
+
+    df = make_df(composite_rows())
+    cfg = mk_cfg(alert_events=["footprint_tap", "essl_tap"],
+                 silent_alert_events=["essl_tap"], **SHIPPED_FILTERS)
+    cfg.data.interval = "1d"
+    rec = FlagRecorder()
+    _restore()
+    frame = df.iloc[:61]
+    last = pd.Timestamp(frame.index[-1]).to_pydatetime()
+    now = last.replace(hour=16, minute=0, second=0, microsecond=0)
+    sc = scanner.LiveScanner(cfg, rec, symbols=[SYM])
+    scanner.load_symbol = lambda sym, d: frame
+    scanner.market_now = lambda c: now
+    try:
+        sent = sc.scan_symbol(SYM)
+    finally:
+        _restore()
+    assert sent == 2, [(t.splitlines()[0], s) for t, s in rec.calls]
+    fp = [(t, s) for t, s in rec.calls if "Footprint TAP" in t]
+    essl = [(t, s) for t, s in rec.calls if "price touched the eSSL level" in t]
+    assert len(fp) == 1 and fp[0][1] is False, fp
+    assert "Footprint TAP 1" in fp[0][0], fp[0][0]
+    assert len(essl) == 1 and essl[0][1] is True, essl
+    assert not any("ALL RULES MATCH" in t for t, _ in rec.calls), rec.messages
+    print("ok test_shipped_footprint_tap1_stays_audible_and_composite_stays_off")
+
+
 # ---------------------------------------------------------------------------
 # 8. The shipped configuration enables the touch alert
 # ---------------------------------------------------------------------------
 def test_shipped_config_enables_essl_tap():
+    """Live chat gets exactly two alerts: Footprint TAP 1, and a silent eSSL TAP.
+
+    The touch alert's rules are unchanged (still in the list, still exempt
+    from the TAP filters). The composite is muted, not deleted.
+    """
     cfg = load_config(os.path.join(ROOT, "config.yaml"))
-    assert "essl_tap" in cfg.scanner.alert_events, cfg.scanner.alert_events
-    assert "essl_ob_tap" in cfg.scanner.alert_events, cfg.scanner.alert_events
-    assert "footprint_tap" in cfg.scanner.alert_events, cfg.scanner.alert_events
+    assert cfg.scanner.alert_events == ["footprint_tap", "essl_tap"], cfg.scanner.alert_events
+    assert "essl_ob_tap" not in cfg.scanner.alert_events
+    assert cfg.scanner.silent_alert_events == ["essl_tap"], cfg.scanner.silent_alert_events
+    assert "footprint_tap" not in cfg.scanner.silent_alert_events
+    assert cfg.scanner.tap_first_only is True
+    assert cfg.scanner.fresh_ob_only is True
     assert "essl_tap" in AppConfig().scanner.alert_events
-    print(f"ok test_shipped_config_enables_essl_tap ({cfg.scanner.alert_events})")
+    assert "footprint_tap" in AppConfig().scanner.alert_events
+    assert AppConfig().scanner.silent_alert_events == ["essl_tap"]
+    print(f"ok test_shipped_config_enables_essl_tap ({cfg.scanner.alert_events}, "
+          f"silent {cfg.scanner.silent_alert_events})")
 
 
 # ---------------------------------------------------------------------------
@@ -709,6 +800,8 @@ def test_legacy_cooldown_entry_still_suppresses():
 
 
 ALL = [
+    test_shipped_essl_tap_is_silent_and_the_text_is_unchanged,
+    test_shipped_footprint_tap1_stays_audible_and_composite_stays_off,
     test_touch_without_footprint_tap_alerts,
     test_old_essl_level_touch_alerts,
     test_filtered_composite_still_alerts_the_touch,

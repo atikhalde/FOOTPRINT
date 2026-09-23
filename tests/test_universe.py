@@ -208,6 +208,12 @@ def test_scanner_batch_path_same_alerts():
         cfg.scanner.min_bars = 100
         cfg.scanner.provisional_alerts = True
         cfg.scanner.alert_cooldown_minutes = 60
+        # parity of the two fetch paths, not the shipped event list
+        cfg.scanner.alert_events = [
+            "essl_ob_tap", "essl_tap", "essl_sweep", "footprint_tap",
+            "defence", "zone_invalid", "essl_created",
+        ]
+        cfg.scanner.silent_alert_events = []
         cfg.scanner.state_file = os.path.join(tempfile.mkdtemp(prefix="fpfssl-uni-"),
                                               "scanner_state.json")
         return cfg

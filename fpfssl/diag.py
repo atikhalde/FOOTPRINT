@@ -239,35 +239,50 @@ def diag_symbol(
             "zone_id": e.zone_id, "pool_id": e.pool_id,
         })
 
-    # Would an alert fire right now? (the composite AND the eSSL level touch)
+    # Would an alert fire right now? Only events the scanner is configured to
+    # send — the shipped set is Footprint TAP 1 (audible) and the silent eSSL
+    # touch. A muted composite is not reported as something the chat will get.
     want = set(cfg.scanner.alert_events or [])
+    silent = set(getattr(cfg.scanner, "silent_alert_events", None) or [])
     by_bar: dict[str, set] = {}
     for e in res.events:
         if e.bar >= cutoff:
             by_bar.setdefault(e.date, set()).add(e.kind)
     for date, kinds in sorted(by_bar.items()):
         comp = K_TAP in kinds and K_ESSL_TAP in kinds
-        if comp:
+        if comp and "essl_ob_tap" in want:
             out.would_alert.append(f"essl_ob_tap @ {date}")
+        if K_TAP in kinds and "footprint_tap" in want:
+            out.would_alert.append(f"footprint_tap @ {date}")
         if K_ESSL_TAP in kinds and "essl_tap" in want:
-            note = " — level already inside the composite above" if comp else ""
+            note = " — level already inside the composite above" if comp and "essl_ob_tap" in want else ""
+            how = "silent, " if "essl_tap" in silent else ""
             out.would_alert.append(
-                f"essl_tap @ {date} (price touched an eSSL level{note})")
+                f"essl_tap @ {date} ({how}price touched an eSSL level{note})")
     if not out.would_alert:
         taps = [w for w in out.watches if w.kind == "fp_ob"]
         essl = [w for w in out.watches if w.kind == "essl"]
         if not taps and not essl:
             out.would_alert.append("no live FP-OB TAP reference and no active eSSL level")
-        elif not taps:
-            out.would_alert.append("no armed footprint OB (composite needs a TAP as well)")
-        elif not essl:
+        elif not taps and ("footprint_tap" in want or "essl_ob_tap" in want):
+            out.would_alert.append("no armed footprint OB (Footprint TAP / composite needs one)")
+        elif not essl and ("essl_tap" in want or "essl_ob_tap" in want):
             out.would_alert.append("no active eSSL level to tap")
         else:
+            nearest = ""
+            if taps and essl:
+                nearest = " (nearest: %s %.2f / %s %.2f)" % (
+                    taps[0].kind, taps[0].level, essl[0].kind, essl[0].level)
+            waiting = []
+            if "footprint_tap" in want:
+                waiting.append("an FP-OB TAP reference for Footprint TAP 1")
+            if "essl_tap" in want:
+                waiting.append("an eSSL level for the silent eSSL TAP")
+            if "essl_ob_tap" in want:
+                waiting.append("both on the same bar for the composite")
             out.would_alert.append(
-                "waiting: price must reach an FP-OB reference AND an eSSL level "
-                "on the same bar for the composite — or just an eSSL level for "
-                "the 💧 essl_tap alert (nearest: %s %.2f / %s %.2f)"
-                % (taps[0].kind, taps[0].level, essl[0].kind, essl[0].level))
+                "waiting: price must reach " + (" and ".join(waiting) or "a configured reference")
+                + nearest)
     return out
 
 

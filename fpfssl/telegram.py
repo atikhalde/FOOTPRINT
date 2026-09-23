@@ -98,7 +98,7 @@ class TelegramNotifier:
         #: delivery counters (folded into the scanner's run report)
         self.stats: dict[str, int] = {
             "sent": 0, "dry_run": 0, "throttled": 0, "retried": 0,
-            "failed": 0, "deformatted": 0, "dropped": 0,
+            "failed": 0, "deformatted": 0, "dropped": 0, "silent": 0,
         }
         self.last_error: str = ""
 
@@ -143,7 +143,7 @@ class TelegramNotifier:
                         "(alerts not recorded as sent, so the next pass retries them)", sec)
 
     # -- one API call ---------------------------------------------------------
-    def _post(self, text: str, parse_mode: str | None) -> tuple[int, dict]:
+    def _post(self, text: str, parse_mode: str | None, silent: bool = False) -> tuple[int, dict]:
         """`(status_code, decoded_body)` — raises requests.RequestException."""
         url = f"{self.cfg.api_base}/bot{self.cfg.token}/sendMessage"
         payload = {
@@ -151,6 +151,11 @@ class TelegramNotifier:
             "text": _fit(text),
             "disable_web_page_preview": True,
         }
+        # Silent = the chat still gets the message, the phone does not buzz.
+        # Omitted (not false) on a normal alert so the payload of Footprint
+        # TAP 1 is unchanged.
+        if silent:
+            payload["disable_notification"] = True
         if parse_mode:
             payload["parse_mode"] = parse_mode
         r = requests.post(url, json=payload, timeout=self.cfg.timeout)
@@ -161,19 +166,24 @@ class TelegramNotifier:
         return r.status_code, body
 
     # -- public API -----------------------------------------------------------
-    def send(self, text: str) -> bool:
+    def send(self, text: str, silent: bool = False) -> bool:
         """Deliver one alert. True = the chat got it (or it was a dry run).
 
-        Never raises: the scanner must keep scanning the rest of the universe
-        when Telegram is unhappy.
+        `silent` sets Telegram `disable_notification`: the message text is
+        sent as-is, without a notification sound. Never raises: the scanner
+        must keep scanning the rest of the universe when Telegram is unhappy.
         """
         if not self.cfg.enabled or self.cfg.dry_run:
-            log.info("[DRY RUN] Telegram message:\n%s", text)
+            log.info("[DRY RUN%s] Telegram message:\n%s",
+                     " silent" if silent else "", text)
             print("\n" + "-" * 74)
-            print("[DRY RUN Telegram]")
+            print("[DRY RUN Telegram — silent, no notification sound]"
+                  if silent else "[DRY RUN Telegram]")
             print(_TAG_RE.sub("", text))
             print("-" * 74)
             self._count("dry_run")
+            if silent:
+                self._count("silent")
             return True
         if not self.ready:
             self.last_error = "Telegram is not configured (token/chat_id missing)"
@@ -202,7 +212,7 @@ class TelegramNotifier:
                 self._count("retried")
             try:
                 self._pace()
-                code, body = self._post(text, mode)
+                code, body = self._post(text, mode, silent)
             except Exception as e:  # noqa: BLE001 - network errors must not kill the scanner
                 last_desc = f"{type(e).__name__}: {e}"
                 log.warning("Telegram send error (%s), attempt %d/%d", last_desc,
@@ -215,6 +225,8 @@ class TelegramNotifier:
 
             if body.get("ok"):
                 self._count("sent")
+                if silent:
+                    self._count("silent")
                 self.last_error = ""
                 self._muted_until = 0.0
                 return True

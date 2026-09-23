@@ -116,6 +116,16 @@ def mk_cfg() -> AppConfig:
     cfg.scanner.min_bars = 50          # the short frames used here are deliberate
     cfg.scanner.provisional_alerts = True
     cfg.scanner.alert_cooldown_minutes = 60
+    # These tests pin the live pipeline (history trim, dedup, session clock),
+    # not the shipped event list. config.yaml sends only Footprint TAP 1 and
+    # the silent eSSL TAP; opt into the composite here so that path stays
+    # covered. Silence is off so a recorder that only accepts `send(text)`
+    # still sees every message.
+    cfg.scanner.alert_events = [
+        "essl_ob_tap", "essl_tap", "essl_sweep", "footprint_tap",
+        "defence", "zone_invalid", "essl_created",
+    ]
+    cfg.scanner.silent_alert_events = []
     # never read or write the repo's live dedup state from a test
     cfg.scanner.state_file = os.path.join(tempfile.mkdtemp(prefix="fpfssl-test-"),
                                           "scanner_state.json")

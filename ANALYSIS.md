@@ -334,8 +334,13 @@ Everything above is ported 1:1 (verified by the hand-crafted scenario suite in
    between sweep-tap and break.
 2. **The composite ALL-RULES signal** (`essl_ob_tap`): on one bar, an active
    eSSL level is tapped **and** a confirmed FP-OB's source-TAP condition fires —
-   i.e. *price taps the eSSL level with all the remaining rules matched*. This is the
-   primary Telegram alert and the primary backtest strategy.
+   i.e. *price taps the eSSL level with all the remaining rules matched*. This
+   remains the primary backtest strategy. The live scanner no longer sends it
+   by default: the shipped chat receives only Footprint TAP 1 (`footprint_tap`,
+   a normal notification, TAP 1 on a fresh OB) and the eSSL level-touch
+   (`essl_tap`, the same message as before, delivered with Telegram
+   `disable_notification`). Adding `essl_ob_tap` back to `alert_events`
+   re-enables the composite without changing its text or its rules.
 3. **`essl_created` / `fresh_essl` events** for tracking new eSSL levels as they form.
 4. Scanner plumbing (polling, dedupe state, cooldowns, Telegram), backtest harness,
    and `report` introspection — none of which alters engine semantics.
@@ -410,13 +415,15 @@ zone is 685 bars old — it fails against the trimmed implementation.
   universe with `backtest --strategy essl_ob_tap` instead of expecting a daily
   stream.
 * The 💧 **eSSL level-touch alert** (`essl_tap`) is the price-only half of that
-  condition and ships **enabled**: price reaching an active eSSL level alerts on
-  its own — no footprint TAP required, no freshness requirement, and never gated
-  by `tap_first_only` / `fresh_ob_only`. A composite the TAP filters reject still
-  produces its touch alert (the message names the filter that dropped the
-  footprint side); the one level a *sent* composite already reported is not
-  repeated. This is what makes a silent session impossible while price is sitting
-  on an eSSL level.
+  condition and ships **enabled, and silent**: price reaching an active eSSL
+  level alerts on its own — no footprint TAP required, no freshness
+  requirement, and never gated by `tap_first_only` / `fresh_ob_only`. The
+  message text is unchanged; `scanner.silent_alert_events` asks Telegram to
+  deliver it with `disable_notification` (the chat gets it, the phone does not
+  buzz). A composite the TAP filters reject still produces its touch alert (the
+  message names the filter that dropped the footprint side); the one level a
+  *sent* composite already reported is not repeated. Footprint TAP 1
+  (`footprint_tap`) is the other shipped alert, and it is **not** silent.
 * The forming last bar goes through section (G) (TAP) and the group-8
   forming-bar eSSL pass, so a LIVE alert can be sent mid-bar; the closed bar
   has a distinct dedupe key and alerts again — that confirmed follow-up is the

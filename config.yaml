@@ -142,29 +142,36 @@ scanner:
   fresh_ob_only: true    # only alert when the tapped OB itself is young
   fresh_ob_max_age_bars: 50  # OB freshness window in bars of data.interval
                          # (daily: 50 ≈ 2.5 months; intraday needs more, e.g. 500 for 15m)
-  # Which events produce Telegram messages. essl_ob_tap is the composite:
-  #   price TAPPED an eSSL level on a bar where a footprint-source TAP also
-  #   fired = "price at eSSL level with ALL the remaining rules matched".
+  # Which events produce Telegram messages. Shipped set is exactly two,
+  # both unchanged in wording and in when they fire:
+  #   footprint_tap  🔻 Footprint TAP 1 — normal notification (sound on).
+  #                  Gated by tap_first_only / fresh_ob_only above, so only
+  #                  TAP 1/N on a young FP-OB is sent.
+  #   essl_tap       💧 eSSL TAP — price touched an active eSSL level. Same
+  #                  alert as before (every active level, fresh or old, with
+  #                  or without a footprint TAP, NOT gated by the TAP filters).
+  #                  Delivered silently: see silent_alert_events.
   # eSSL taps are touches of a level that is STILL ACTIVE when the bar ends —
   # exactly the levels the indicator draws. A bar that closes back above after
   # tapping (sweep + reclaim) is a valid tap; a bar that closes BELOW the level
   # retires it in the indicator (first full penetration is terminal) and is
   # reported — if at all — as essl_break, never as a touch.
   alert_events:
-    - essl_ob_tap        # 🚨 composite — primary signal (TAP #1 + fresh OB only)
-    - essl_tap           # 💧 price TOUCHED an eSSL level — every active level, fresh or old,
-                         #    with or without a footprint TAP that bar; NOT gated by the
-                         #    TAP filters above, so a filtered composite still alerts its touch
-    - footprint_tap      # source-compatible TAP #1 on a fresh FP-OB
-    # muted — TAP #1 / fresh-OB focus (add back to the list to re-enable):
+    - footprint_tap      # 🔻 Footprint TAP 1 — source reference touched (audible)
+    - essl_tap           # 💧 eSSL TAP — price touched an active eSSL level (silent)
+    # muted — add back to the list to re-enable (wording/rules unchanged):
+    # - essl_ob_tap      # 🚨 composite — eSSL tap + footprint TAP on the same bar
     # - essl_sweep       # eSSL penetration + close reclaim (liquidity grab)
     # - essl_break       # ⚠️ eSSL closed below — the level is retired (this is
     #                    #    what a "NOT reclaimed" tap bar really is)
     # - defence          # source defence confirmed after a TAP
     # - zone_invalid     # OB invalidated (stop) or touch limit exceeded
     # - essl_created     # new eSSL reference published (fresh major low)
-    # optional (off by default — add to the list to enable):
     # - footprint_created# every newly confirmed FP-OB (TAP armed at its reference)
+  # Telegram disable_notification for these events: the message text is the
+  # same, the phone does not buzz. Footprint TAP 1 is deliberately not here.
+  silent_alert_events:
+    - essl_tap
 
 telegram:
   enabled: true
