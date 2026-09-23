@@ -6,13 +6,16 @@ A bar-for-bar Python port of the Pine v6 indicator
 
 * a **live market scanner** over the **FULL NSE equity universe** (default: **daily TF**,
   narrowed by the **size filters** — market cap > ₹1,000 Cr and price > ₹100)
-  that sends **Telegram alerts** whenever, in *any* watched stock, price **taps an eSSL
-  level with all the remaining rules matched** (a confirmed footprint OB's source-TAP
-  condition fires on the same bar), **and** — enabled by default — whenever price simply
-  **touches an eSSL level** (💧 `essl_tap`: any active level, fresh or old, no footprint
-  TAP required), plus defence / sweep / invalidation alerts;
-* a **backtest engine** that trades exactly those signals (next-open entry, OB stop,
-  R-multiple target, time exit) with full statistics;
+  that sends **exactly two Telegram alerts**, both unchanged in wording and rules:
+  **Footprint TAP 1** (`footprint_tap` — a normal notification, TAP 1/N on a fresh
+  FP-OB only) and a **silent eSSL TAP** (`essl_tap` — price touched any active eSSL
+  level, fresh or old, no footprint TAP required; same message, delivered with
+  Telegram `disable_notification` so the phone does not buzz). The 🚨 composite
+  and defence / sweep / invalidation alerts stay implemented and can be turned
+  back on in `scanner.alert_events`; they are not sent by default;
+* a **backtest engine** that trades the same signals (default strategy still
+  `essl_ob_tap`; next-open entry, OB stop, R-multiple target, time exit) with
+  full statistics;
 * a **report** command to inspect live zones, eSSL levels and FRESH lows at any time.
 
 > Read **[ANALYSIS.md](ANALYSIS.md)** first — it contains the deep, section-by-section
@@ -115,7 +118,33 @@ the scanner silently.
 
 ---
 
-## The primary alert (what you asked for)
+## Live alerts (what the scanner sends)
+
+The chat receives **only** these two. Neither message, neither rule, and neither
+filter changed — the composite and the other events are muted, and the eSSL
+touch is delivered silently.
+
+### Footprint TAP 1 (`footprint_tap`) — audible
+
+Source-compatible TAP on a confirmed FP-OB, narrowed by the shipped filters to
+**TAP 1/N on a young zone** (`tap_first_only` + `fresh_ob_only`). No eSSL
+coincidence is required. Telegram notifies normally.
+
+```
+🔻 Footprint TAP 1 — source reference touched
+📈 RELIANCE.NS (Daily) 2026-09-10
+🧱 FP-OB #7 2,448.00-2,462.50 (TAP 1/4, TAPPED / pending)
+   ref 2,463.10 ← adj 2,460.25 | stop 2,445.90
+```
+
+### Silent eSSL TAP (`essl_tap`) — enabled, no notification sound
+
+**Price touched an eSSL level → the same alert as before**, on its own terms,
+sent with Telegram `disable_notification` (the message is identical; the phone
+does not buzz). Remove `essl_tap` from `scanner.silent_alert_events` to make
+it audible again without changing the text.
+
+### The composite (muted — add `essl_ob_tap` back to re-enable)
 
 `essl_ob_tap` — **price TAPS an eSSL level with ALL the remaining rules matched**:
 
@@ -145,9 +174,10 @@ Action: source-compatible long reference at TAP. Stop below OB invalidation.
 The same bar may carry extra context (e.g. the tap is also a confirmed eSSL **sweep +
 reclaim** — a liquidity grab — which the message marks).
 
-### The 💧 eSSL level-touch alert (`essl_tap`) — enabled by default
+### The 💧 eSSL level-touch alert (`essl_tap`) — rules, unchanged
 
-**Price touched an eSSL level → you get an alert**, on its own terms:
+**Price touched an eSSL level → you get this alert**, on its own terms
+(delivery is silent; the rules below are the ones that decide *whether* it fires):
 
 * **any** active eSSL level, **fresh or old** — the only age limit is
   `engine.essl_tap_max_age` (default 250 bars = the pool's own expiry, so in
@@ -186,22 +216,22 @@ that follow-up is what delivers `RECLAIMED ✅` on a daily bar like the FMGOETZE
 
 ### Other alerts (all in `scanner.alert_events`, toggle freely)
 
-| event | meaning |
-|---|---|
-| `essl_ob_tap` | 🚨 the composite above (primary) |
-| `essl_tap` | 💧 price touched an active eSSL level (fresh or old; footprint TAP not required) |
-| `essl_sweep` | eSSL penetration with close reclaim — liquidity grabbed at the external low |
-| `essl_break` | ⚠️ eSSL closed below (no reclaim) — the indicator retires the level at that close |
-| `footprint_tap` | source-compatible TAP on any confirmed FP-OB (no eSSL coincidence required) |
-| `defence` | source defence confirmed after a TAP (bullish bar, CLV ≥ 0.65, RVOL ≥ 1.3, close > zone top, micro-BOS) |
-| `zone_invalid` | OB invalidated (live close < fixed stop) or tap limit exceeded |
-| `essl_created` | a new eSSL reference was published (fresh major low) — a future tap target |
+| event | meaning | shipped |
+|---|---|---|
+| `footprint_tap` | 🔻 Footprint TAP 1 on a fresh FP-OB (no eSSL coincidence required) — **audible** | on |
+| `essl_tap` | 💧 price touched an active eSSL level (fresh or old; footprint TAP not required) — **silent** | on |
+| `essl_ob_tap` | 🚨 the composite above | muted |
+| `essl_sweep` | eSSL penetration with close reclaim — liquidity grabbed at the external low | muted |
+| `essl_break` | ⚠️ eSSL closed below (no reclaim) — the indicator retires the level at that close | muted |
+| `defence` | source defence confirmed after a TAP (bullish bar, CLV ≥ 0.65, RVOL ≥ 1.3, close > zone top, micro-BOS) | muted |
+| `zone_invalid` | OB invalidated (live close < fixed stop) or tap limit exceeded | muted |
+| `essl_created` | a new eSSL reference was published (fresh major low) — a future tap target | muted |
 
 ### TAP signal filters (TAP #1 + fresh OB only)
 
-`config.yaml` ships with the TAP stream narrowed to first touches of young zones —
-both the 🚨 composite and the standalone `footprint_tap` must pass these gates
-(the 💧 `essl_tap` level-touch alert is **exempt**):
+`config.yaml` ships with the TAP stream narrowed to first touches of young zones.
+Those gates apply to `footprint_tap` (and to the 🚨 composite, if you add it
+back). The silent 💧 `essl_tap` level-touch alert is **exempt**:
 
 ```yaml
 scanner:
@@ -210,11 +240,12 @@ scanner:
   fresh_ob_max_age_bars: 50  # OB age = tap_bar − ob_born_bar, in data.interval bars
 ```
 
-Skipped taps are logged (`composite skipped — OB #7 age 132 bars > fresh window
+Skipped taps are logged (`footprint TAP skipped — OB #7 age 132 bars > fresh window
 50`) so a quiet pass still explains itself. Set either toggle to `false` to
-restore the unfiltered stream. The default `alert_events` list is
-`essl_ob_tap` + `essl_tap` + `footprint_tap` — add the muted events back to
-re-enable them.
+restore the unfiltered stream. The shipped `alert_events` list is
+`footprint_tap` + `essl_tap` (the eSSL touch is in `silent_alert_events`) —
+add a muted event back to the list to re-enable it. The message text does not
+change either way.
 
 ### Size filters — market cap > ₹1,000 Cr and price > ₹100
 
@@ -449,11 +480,12 @@ workflow's run summary). It prints exactly which rule is not satisfied:
 | `⛔ SKIPPED — only N bars < min_bars` | not enough history to warm the engine up |
 | `⛔ FILTERED OUT (size filters) — …` | the symbol is below `min_market_cap_cr` / `min_price` and is **not scanned at all** (raise the thresholds or set them to `0` to see it again) |
 | `⏳ newest bar … is from a previous session` | pre-open/holiday: nothing new to alert yet (warm-up pass) |
-| `armed FP-OBs: none` | no confirmed footprint OB — the composite needs a TAP, so nothing can fire (the 💧 eSSL touch alert does **not** need one) |
-| `armed eSSL: none` | no active eSSL level to tap (all breached/expired) — neither the composite nor the 💧 touch alert can fire |
+| `armed FP-OBs: none` | no confirmed footprint OB — Footprint TAP 1 cannot fire (the silent 💧 eSSL touch does **not** need one) |
+| `armed eSSL: none` | no active eSSL level to tap (all breached/expired) — the silent eSSL TAP cannot fire |
 | both armed, far away | the setup is live but price has not reached the references yet |
-| `→ essl_ob_tap @ …` | the composite **is** firing on a recent bar — check the Telegram credentials |
-| `→ essl_tap @ … (price touched an eSSL level)` | the 💧 touch alert **is** firing on a recent bar |
+| `→ footprint_tap @ …` | Footprint TAP 1 **is** firing on a recent bar — check the Telegram credentials |
+| `→ essl_tap @ … (silent, price touched an eSSL level)` | the 💧 touch **is** firing; it is delivered without a notification sound |
+| `→ essl_ob_tap @ …` | only when `essl_ob_tap` has been added back to `alert_events` |
 | `scan` exits: `Telegram is NOT configured` | a live run would drop everything, so it refuses to start (use `--dry-run` to preview) |
 
 **Every run also writes its own version of that answer**: `state/scan_report.json`
@@ -493,9 +525,11 @@ fails does **not** record its dedup key, so the next pass retries it — at-leas
 delivery rather than a silent drop. `401`/`403`/`404` are reported once and not
 retried: that is a bot-token/chat-id problem, not a rate problem.
 
-The composite alert is deliberately strict (footprint TAP **and** eSSL tap on the
+The live chat's audible alert is Footprint TAP 1; the eSSL touch arrives in the
+same chat without a notification sound. The composite (off unless `essl_ob_tap`
+is added back) is deliberately strict (footprint TAP **and** eSSL tap on the
 *same* bar — the "ALL RULES" condition), so expect a *low* rate rather than a
-daily stream. Measured on the configured NSE universe (15m, 60 days of Yahoo
+daily stream if you turn it on. Measured on the configured NSE universe (15m, 60 days of Yahoo
 bars, ~1470 bars per symbol): 0–5 composite bars per symbol, i.e. roughly **one
 alert per symbol per month**, clustered when price sweeps an external low into
 an armed OB — plus `footprint_tap`/`essl_sweep`/`defence` events if you enable
@@ -561,7 +595,7 @@ python tests/test_engine.py             # 10 indicator-parity scenarios (daily b
 python tests/test_fidelity_live.py      # 10 exact-match + live-NSE/intraday tests
 python tests/test_live_scanner.py       # 10 end-to-end live-scanner tests (offline feed)
 python tests/test_tap_filters.py        # 5 TAP #1 / fresh-OB filter tests
-python tests/test_essl_touch_alerts.py  # 10 eSSL level-touch alert tests
+python tests/test_essl_touch_alerts.py  # eSSL level-touch alert tests
 python tests/test_universe.py           # full-NSE universe + batched-download tests
 python tests/test_size_filters.py       # 16 size-filter / stop-after-pass tests
 python tests/test_alert_delivery.py     # 21 Telegram delivery + session-coverage tests

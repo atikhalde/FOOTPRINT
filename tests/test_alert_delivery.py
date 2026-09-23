@@ -112,6 +112,28 @@ def cfg_telegram(**kw) -> TelegramConfig:
 # ---------------------------------------------------------------------------
 # 1-4. Telegram delivery
 # ---------------------------------------------------------------------------
+def test_silent_send_disables_the_notification_only():
+    """eSSL TAP is silent; a normal send (Footprint TAP 1) still buzzes.
+
+    `disable_notification` is Telegram's silent-message flag. It must be set
+    only when asked — a loud alert's payload stays exactly as it was.
+    """
+    post = FakePost([Resp(), Resp()])
+    tg.requests.post = post
+    n = tg.TelegramNotifier(cfg_telegram(min_interval_sec=0.0))
+    try:
+        assert n.send("🔻 Footprint TAP 1", silent=False)
+        assert n.send("💧 eSSL TAP", silent=True)
+    finally:
+        _restore()
+    loud, quiet = post.calls[0]["payload"], post.calls[1]["payload"]
+    assert "disable_notification" not in loud, loud
+    assert quiet.get("disable_notification") is True, quiet
+    assert quiet["text"] == "💧 eSSL TAP", quiet
+    assert n.stats["sent"] == 2 and n.stats["silent"] == 1, n.stats
+    print("ok test_silent_send_disables_the_notification_only")
+
+
 def test_sends_are_paced():
     """Telegram allows ~1 msg/s per chat: back-to-back sends must space out."""
     post = FakePost([Resp(), Resp()])
@@ -745,7 +767,9 @@ def test_shipped_config_covers_the_session():
     assert cfg.scanner.reschedule_max_runs_per_day > 0
     assert 0.2 <= cfg.telegram.min_interval_sec <= 1.5, cfg.telegram.min_interval_sec
     assert cfg.telegram.max_retries >= 2 and cfg.telegram.max_wait_sec >= 10
-    assert cfg.scanner.alert_events == ["essl_ob_tap", "essl_tap", "footprint_tap"]
+    assert cfg.scanner.alert_events == ["footprint_tap", "essl_tap"], cfg.scanner.alert_events
+    assert cfg.scanner.silent_alert_events == ["essl_tap"], cfg.scanner.silent_alert_events
+    assert "essl_ob_tap" not in cfg.scanner.alert_events
     assert cfg.scanner.provisional_alerts is True
     # The workflow must actually grant what the re-arm needs, run this suite, and
     # publish the report. Suite names are matched without the `.py` because the
@@ -791,6 +815,7 @@ def test_unknown_config_key_is_not_silent():
 
 
 ALL = [
+    test_silent_send_disables_the_notification_only,
     test_sends_are_paced,
     test_429_is_deferred_not_dropped,
     test_rate_limit_exhaustion_is_reported,

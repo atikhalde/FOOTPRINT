@@ -220,6 +220,7 @@ def format_report(rep: dict) -> str:
         f"  suppressed    : dedup {st.get('suppressed_dedup', 0)}, cooldown "
         f"{st.get('suppressed_cooldown', 0)}  (state keys: {rep.get('state_keys')})",
         f"  alert events  : {', '.join(rep.get('alert_events') or [])}",
+        f"  silent events : {', '.join(rep.get('silent_alert_events') or []) or 'none'}",
         f"  stopped       : {rep.get('stop_reason')}",
         f"  re-armed      : {rep.get('rescheduled', 'n/a')}",
     ]
@@ -339,7 +340,8 @@ def cmd_test_telegram(args):
     from .scanner import timeframe_label
     tf = timeframe_label(cfg.data.interval)
     ok = n.send("<b>FPFSSL8.2</b> test message — Telegram connection works ✅\n"
-                f"{tf}-TF eSSL tap + footprint alerts will arrive in this format.")
+                f"{tf}-TF Footprint TAP 1 alerts arrive with a notification; "
+                "eSSL TAP alerts arrive in the same chat, silently.")
     print("sent" if ok else "send failed")
 
 

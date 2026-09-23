@@ -133,6 +133,10 @@ def test_old_zone_tap1_passes_without_fresh_filter():
     cfg.scanner.min_bars = 50
     cfg.scanner.tap_first_only = False
     cfg.scanner.fresh_ob_only = False
+    # this case is about the filters being off, not about the shipped event
+    # list (which no longer includes the composite)
+    cfg.scanner.alert_events = ["essl_ob_tap", "footprint_tap"]
+    cfg.scanner.silent_alert_events = []
     cfg.scanner.state_file = os.path.join(
         tempfile.mkdtemp(prefix="fpfssl-tapfilter-"), "scanner_state.json")
     _restore()

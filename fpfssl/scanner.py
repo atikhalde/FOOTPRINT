@@ -24,7 +24,12 @@ Flow per poll, per symbol:
      outcome goes to `essl_break`, never to the touch channel, and a forming
      bar that is already below the level waits for the close instead of
      alerting mid-break.
-  5. dedupe against persisted state, apply cooldowns, format, send Telegram
+  5. dedupe against persisted state, apply cooldowns, format, send Telegram.
+     The shipped `alert_events` list sends only two of those: Footprint TAP 1
+     (`footprint_tap`, a normal notification) and the eSSL touch (`essl_tap`,
+     the same message, delivered with Telegram `disable_notification` when the
+     kind is listed in `silent_alert_events`). Everything else stays
+     implemented and stays quiet until it is added back to `alert_events`.
 
 Dedup key: symbol | kind | bar-time | confirmed? | zone-or-pool-id
 Provisional (forming-bar) alerts carry a distinct key, so after the bar closes
@@ -298,6 +303,7 @@ class LiveScanner:
                      else f"poll every {cfg.scanner.poll_minutes:g} min until the close"),
             "alerts_dry_run": bool(cfg.telegram.dry_run),
             "alert_events": list(cfg.scanner.alert_events or []),
+            "silent_alert_events": list(getattr(cfg.scanner, "silent_alert_events", None) or []),
             "size_filters": self.filters.describe(),
             "state_keys": len(self.state.get("alerted", {})),
             "rearm_chain": dict(self.state.get("chain") or {}),
@@ -592,10 +598,33 @@ class LiveScanner:
             return False
         return candidate > previous
 
+    def _silent_kinds(self) -> set[str]:
+        """Event kinds delivered with Telegram `disable_notification`.
+
+        The message text is unchanged. Only the phone stays quiet. Footprint
+        TAP 1 is not in the shipped list.
+        """
+        return set(getattr(self.cfg.scanner, "silent_alert_events", None) or [])
+
+    def _deliver(self, message: str, silent: bool) -> bool:
+        """Hand one formatted alert to the notifier.
+
+        A notifier that does not accept `silent` (the offline test recorders)
+        is called the old way, so the flag can never drop an alert.
+        """
+        send = self.notifier.send
+        if not silent:
+            return bool(send(message))
+        try:
+            return bool(send(message, silent=True))
+        except TypeError:
+            return bool(send(message))
+
     def _try_alert(self, sym: str, kind: str, message: str, dedup_key: str,
                    cooldown_key: str | None = None,
                    follow_up_of: str | None = None,
-                   bar_time: str | None = None) -> bool:
+                   bar_time: str | None = None,
+                   silent: bool = False) -> bool:
         """Send one alert unless it was already sent or is inside its cooldown.
 
         `cooldown_key` defaults to `symbol|kind` (one stream per event type).
@@ -648,7 +677,7 @@ class LiveScanner:
                     return False
             except Exception:  # noqa: BLE001
                 pass
-        ok = self.notifier.send(message)
+        ok = self._deliver(message, silent)
         if ok:
             # In-memory dedupe/cooldown always applies (so a --dry-run preview
             # shows exactly what a live pass would send), but dry runs never
@@ -842,7 +871,8 @@ class LiveScanner:
                                      f"{tap.zone_id}|{essl.pool_id}" if tap.confirmed else None)
                         if self._try_alert(sym, "essl_ob_tap", msg, key,
                                            follow_up_of=follow_up,
-                                           bar_time=date):
+                                           bar_time=date,
+                                           silent="essl_ob_tap" in self._silent_kinds()):
                             sent += 1
                             covered = True
                         if covered:
@@ -909,7 +939,8 @@ class LiveScanner:
                 follow_up = (f"{sym}|{cfg.data.interval}|{kind}|{date}|False|{obj}"
                              if ev.confirmed else None)
                 if self._try_alert(sym, kind, msg, key, cooldown_key=cd,
-                                   follow_up_of=follow_up, bar_time=date):
+                                   follow_up_of=follow_up, bar_time=date,
+                                   silent=kind in self._silent_kinds()):
                     sent += 1
         return sent
 
